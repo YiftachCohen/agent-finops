@@ -2,7 +2,7 @@
 
 All notable changes are documented here. Versions use semantic versioning.
 
-## [Unreleased]
+## [0.5.0] - 2026-08-02
 
 Fixed
 - A parallel tool call is no longer attributed to one of its tools alone. Claude
@@ -82,6 +82,29 @@ Fixed
   under-counting it after a transient read error.
 
 Changed
+- `report` replaces `Cache-read share: 96.7% · output-cost share: 16.1%` with one
+  line that names both denominators: `Cache reads are 96.7% of prompt tokens but
+  53% of estimated cost — a cache read bills at 0.1x the input rate.` The old
+  line sat directly under `Cost by class: cache-read $2,710.50 (53%)`, where two
+  numbers describing the same class read as a contradiction unless you already
+  knew one was tokens and the other dollars — which is the confusion this tool
+  exists to remove. The cost figure is the one the line above already printed,
+  the output share it dropped is a share of that same split, and
+  `insights.cacheReadShare` and `insights.outputCostShare` are unchanged in the
+  JSON, where tags and other callers read them.
+- The dashboard's cost-per-turn reading is stated to three decimals rather than
+  four: `$0.090`, not `$0.0902`. It now shares one helper with the tool `$/call`
+  figure and with the CLI's, so a turn reads the same on both surfaces. The
+  four-decimal formatter stays where it belongs — on sub-cent figures that would
+  otherwise print as `$0.00`.
+- The dashboard's middle two readings are now run rate and identified savings.
+  Cache-read share was a share of *tokens*, which the cost-by-class legend and
+  every bar on the page now state in dollars instead, and output-cost share
+  repeated one segment of that same split. What replaced them is what an operator
+  acts on: what this window costs per active day, and what the ranked findings
+  below are worth in total if every one of them is acted on. Token volume and
+  cost per turn are unchanged. Either new reading falls back to a dash and a
+  neutral note on legacy or tag-shaped data rather than inventing a figure.
 - The index version is bumped once for the uncommitted-tail split, the retired
   section, the new salt, and the message-grouped tool cohort — whose resume state
   replaces `pendingTools` with `cohortTools`, `currentTools`, and a salted
@@ -100,6 +123,47 @@ Changed
   aggregated the whole corpus three times.
 
 Added
+- The dashboard and `report` say what changed, not just that something did. The
+  headline stated that spend rose against the previous period and stopped there,
+  leaving the operator's next question — "driven by what?" — to a separate
+  command, even though `analyzeTrend` already ranked the per-model and
+  per-project dollar deltas that answer it. The page gains a *what changed*
+  section between the readings and the ranked breakdown, listing the three
+  models and three projects whose dollars moved most, with direction carried by
+  a leading sign and a step of ink rather than by a hue the monochrome page does
+  not have. `humanReport(report, labels, trend)` prints the same block, two rows
+  a side, directly under the run rate; the third argument is optional, so every
+  existing caller is unchanged. Both surfaces read the fixed seven-day pair the
+  hotspot rules already read, state the two windows they compared, and say that
+  a row is where the money moved and not why it moved. With too little history
+  to build a second window the section renders its empty state rather than
+  disappearing, and the terminal block is simply absent.
+- `report` states a run rate. `insights.runRate` carries spend per active day,
+  the days it was measured over, the first and last of them, what that pace comes
+  to over 30 days, and the peak day against the median one; `report` prints it
+  directly under the estimate and names the peak day when it cost at least twice
+  the median. "Active day" means a day that has records, not a day of the
+  calendar span: a month worked on twelve days is a twelve-day rate, because
+  averaging in the days nobody ran the agent describes a workload that was not
+  running. The projection is a pace on the window that already happened, never a
+  forecast and never a bill. A window with no dated record has no rate and prints
+  no line.
+- `report` lists projects, between the models and the sessions, ranked by
+  estimated cost and named by the local label where `agent-finops label` has
+  given an id one. `buildReport` already computed `topProjects`, and for anyone
+  running several agent workspaces at once it is the strongest reading of where
+  the money went; the report never showed it.
+- `report` prints the median, mean, and p90 cost of a turn beside the cache and
+  output shares. `insights.perTurnUsd` existed and only the dashboard read it,
+  so the gap between the turn most of a window looks like and the turn its
+  average describes was invisible in the terminal.
+- Session rows in `report` and `sessions` carry the project they ran under and
+  the average context they haul into each turn, beside the cost, tokens, and turn
+  count they already had. A bare fingerprint and a dollar figure is not something
+  anyone can act on; "expensive session, in this project, running 331K contexts"
+  is the diagnosis. `humanReport(report, labels)` and `humanSessions(sessions,
+  labels)` take the label map as an optional second argument, so a caller with no
+  labels file passes nothing.
 - Tool/MCP rows now carry per-use economics and attribution confidence instead
   of only ranking by ubiquity. `usdPerCall` (usd / calls, null with no counted
   call) and `soloShare` (the fraction of a tool's attributed cost that came
@@ -123,12 +187,45 @@ Added
 - `hotspots` recommendations now carry the number the decision turns on.
   Model concentration re-prices the top model's own tokens at its cheaper
   sibling's rate and states the difference as an explicit upper bound rather
-  than a promise; the cache finding compares what writes cost against what reads
-  saved against an uncached bill, because a window can read overwhelmingly from
-  cache and still lose money on it; a new `context-bloat` finding names the one
-  session whose per-turn context is why it is expensive; and an expensive `Bash`
-  cohort points at this tool's own PostToolUse filter, quoting what the local
-  ledger has already removed when the hook has run.
+  than a promise; a new `context-bloat` finding names the one session whose
+  per-turn context is why it is expensive; and an expensive `Bash` cohort points
+  at this tool's own PostToolUse filter, quoting what the local ledger has
+  already removed when the hook has run.
+- `hotspots` ranks its findings by what acting on them is estimated to be worth.
+  Every recommendation carries `estimatedSavingsUsd` — the honest upper bound of
+  acting on it, or `null` where no counterfactual can be defended — and the list
+  is sorted by it, unquantified findings last, ties broken by severity and then
+  by rule order. The analysis also carries `totalEstimatedSavingsUsd`, and
+  `hotspots` leads with it. Four rules quantify: model concentration re-prices
+  the top model's tokens at its cheaper sibling's rate; `cache-ttl` prices the
+  1-hour premium at the 5-minute rate; `context-bloat` scales the session's
+  cache-read dollars to a 150K-token prompt; and `bash-output-filter` prices the
+  tokens the local filter has actually removed as the cache write they would
+  have become. The rest report `null` rather than invent a counterfactual: an
+  MCP cohort is correlation, shorter output is a different answer rather than
+  the same one for less, and a spend increase may simply be more work. Every
+  figure is a ceiling on the window that already happened, not a forecast.
+- The always-positive cache verdict is replaced by the TTL question. Comparing
+  cache-write cost against what the reads would have cost uncached returned the
+  same answer — "caching is net positive" — for every agent workload, because a
+  cache read is billed at a tenth of the input rate and an agent re-reads its
+  context on every turn; a rule whose verdict never varies ranks nothing. The
+  new `cache-ttl` finding reports the decision that does vary: what share of the
+  cache-write bill was bought at the 1-hour rate (2x input) rather than the
+  5-minute one (1.25x), and what the difference is worth. It presents both
+  directions, because this is a tradeoff rather than a defect — a 1-hour write
+  costs 60% more, but a 5-minute entry that expires between turns is re-written
+  in full, and one re-write costs more than the premium saved — so the lever is
+  session cadence, not a flag to flip. The old token-share reading survives as
+  `cache-efficiency` for a window whose per-class dollars are missing, or whose
+  cache bill is large but already mostly 5-minute writes.
+- `session-outlier` and `context-bloat` no longer both name the top session. The
+  two are one diagnosis each: when context bloat claims a session, it is the
+  only finding raised for it, and `session-outlier` is left for the genuinely
+  different case — an expensive session whose per-turn context is normal, which
+  is a session made expensive by how many turns it ran rather than how heavy
+  each one was. Its evidence now says so, with the turn count and the average
+  prompt size that separate the two readings.
 - `hotspotAnalysis(report, extras)` takes optional context a report cannot hold
   on its own — the filter ledger and a trend over the same records — and the
   `hotspots` and `dashboard` commands supply both. Every rule that reads them

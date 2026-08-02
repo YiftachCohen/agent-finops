@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildReport, compareSnapshots, hotspotAnalysis, humanComparison, humanHotspots, humanReport, humanTools } from "../src/report.mjs";
+import { buildReport, compareSnapshots, hotspotAnalysis, humanComparison, humanHotspots, humanReport, humanSessions, humanTools } from "../src/report.mjs";
+import { analyzeTrend } from "../src/trends.mjs";
 
 function record(overrides = {}) {
   return {
@@ -113,6 +114,267 @@ test("per-turn cost is described by its distribution, never by the turn list", (
   const single = buildReport([record()]);
   assert.equal(single.insights.perTurnUsd.p50, single.total.usd);
   assert.equal(single.insights.perTurnUsd.p90, single.total.usd);
+});
+
+// Sonnet 4.6 bills output at $15/M, so one turn of N million output tokens is
+// exactly $15N and every figure below is a whole number of dollars.
+function outputTurn(day, millions, overrides = {}) {
+  return record({
+    messageId: `m${day}-${millions}`,
+    requestId: `r${day}-${millions}`,
+    timestamp: `2026-07-${day}T10:00:00Z`,
+    usage: { input: 0, cacheCreate: 0, cacheRead: 0, output: millions * 1e6 },
+    ...overrides,
+  });
+}
+
+test("the run rate is spend per active day, not per day of the calendar span", () => {
+  // Three worked days inside a fifteen-day span. Dividing by the span would
+  // report a fifth of the pace of the days the agent actually ran, which is the
+  // pace anyone projecting forward is asking about.
+  const report = buildReport([outputTurn("01", 1), outputTurn("08", 1), outputTurn("15", 1)]);
+  const rate = report.insights.runRate;
+  assert.equal(rate.days, 3, "the twelve idle days in the span are not days");
+  assert.equal(rate.firstDay, "2026-07-01");
+  assert.equal(rate.lastDay, "2026-07-15");
+  assert.ok(Math.abs(rate.usdPerDay - 15) < 1e-9);
+  // A pace, stated as a fixed multiple of the daily rate.
+  assert.ok(Math.abs(rate.projectedMonthlyUsd - 450) < 1e-9);
+  assert.deepEqual(Object.keys(rate).sort(), ["days", "firstDay", "lastDay", "peakDay", "projectedMonthlyUsd", "usdPerDay"]);
+
+  // A record with no usable timestamp cannot be placed on a day, so it creates
+  // no day of its own — but its cost is still the window's, and the rate spreads
+  // the whole estimate over the days it could place rather than dropping it.
+  const undated = buildReport([outputTurn("01", 1), record({ messageId: "mx", requestId: "rx", timestamp: null, usage: { input: 0, cacheCreate: 0, cacheRead: 0, output: 1e6 } })]);
+  assert.equal(undated.total.usd, 30);
+  assert.equal(undated.insights.runRate.days, 1);
+  assert.ok(Math.abs(undated.insights.runRate.usdPerDay - 30) < 1e-9);
+
+  // Nothing dated at all is no rate rather than a division by zero.
+  assert.equal(buildReport([]).insights.runRate, null);
+  assert.equal(buildReport([record({ timestamp: null })]).insights.runRate, null);
+  // A window that excludes every record has no days either.
+  assert.equal(buildReport([outputTurn("01", 1)], { sinceMs: Date.parse("2026-08-01T00:00:00Z") }).insights.runRate, null);
+});
+
+test("the peak day is measured against the median day, so one spike cannot hide itself", () => {
+  // Nine ordinary days and one that cost three times as much. Against a mean the
+  // spike would be part of its own baseline and read as a smaller multiple.
+  const days = Array.from({ length: 9 }, (_, i) => outputTurn(String(i + 1).padStart(2, "0"), 1));
+  const rate = buildReport([...days, outputTurn("10", 3)]).insights.runRate;
+  assert.equal(rate.peakDay.day, "2026-07-10");
+  assert.ok(Math.abs(rate.peakDay.usd - 45) < 1e-9);
+  assert.ok(Math.abs(rate.peakDay.ratioToMedian - 3) < 1e-9);
+
+  // A flat window has a peak day like any other, at 1x: the ratio is what
+  // decides whether it is worth naming, not the existence of a maximum.
+  assert.equal(buildReport(days).insights.runRate.peakDay.ratioToMedian, 1);
+
+  // An unpriced window has a median of zero, and a multiple of zero is not a
+  // reading. Null rather than an infinity.
+  const unpriced = buildReport([outputTurn("01", 1, { model: "claude-internal-preview" })]).insights.runRate;
+  assert.equal(unpriced.peakDay.usd, 0);
+  assert.equal(unpriced.peakDay.ratioToMedian, null);
+});
+
+test("humanReport states the run rate under the cost, and names the peak day only when it is anomalous", () => {
+  const report = buildReport([outputTurn("01", 1), outputTurn("02", 3)]);
+  const lines = humanReport(report).split("\n");
+  // Directly under the estimate: a total nobody can place in time is not a rate.
+  assert.equal(lines[2], "Estimated cost: $60.00");
+  assert.equal(lines[3], "Run rate: $30.00/day over 2 active day(s) · ~$900/30d at this pace · peak 2026-07-02 $45.00 (3.0x the median day)");
+
+  // Below 2x the median the peak is just the busiest day of a normal window.
+  const even = humanReport(buildReport([outputTurn("01", 1), outputTurn("02", 1.2)])).split("\n")[3];
+  assert.equal(even, "Run rate: $16.50/day over 2 active day(s) · ~$495/30d at this pace");
+
+  // Under $100 the projection keeps its cents; above it, cents on an
+  // extrapolation would claim an accuracy the extrapolation does not have.
+  assert.match(humanReport(buildReport([outputTurn("01", 0.1)])), /~\$45\.00\/30d at this pace/);
+
+  // No dated record, no rate line at all — and the report is otherwise intact.
+  const undated = humanReport(buildReport([record({ timestamp: null })]));
+  assert.ok(!undated.includes("Run rate:"));
+  assert.match(undated, /Estimated cost: /);
+});
+
+test("humanReport prints the per-turn distribution the dashboard already shows", () => {
+  const report = buildReport([outputTurn("01", 1), outputTurn("02", 3)]);
+  const line = humanReport(report).split("\n").find((row) => row.startsWith("Cost per turn:"));
+  // Three decimals under a dollar and two above, the same split `$/call` uses.
+  assert.equal(line, "Cost per turn: median $15.00 · mean $30.00 · p90 $45.00");
+  assert.match(humanReport(buildReport([outputTurn("01", 0.001)])), /Cost per turn: median \$0\.015 · mean \$0\.015 · p90 \$0\.015/);
+
+  // Nothing priced is no distribution, so no line rather than a row of zeroes.
+  assert.ok(!humanReport(buildReport([record({ model: "claude-internal-preview" })])).includes("Cost per turn:"));
+  assert.ok(!humanReport(buildReport([])).includes("Cost per turn:"));
+});
+
+test("the cache-read line names both denominators, so a token share cannot read as a cost share", () => {
+  // The fixture from the cost-by-class test: cache reads are four times the
+  // tokens of any other class and a seventh of the dollars. Printing "96.7%"
+  // under "cache-read (15%)" with neither unit stated is the exact confusion
+  // this tool exists to remove.
+  const report = buildReport([record({ usage: { input: 1e5, cacheCreate: 1e6, cacheCreate1h: 6e5, cacheCreate5m: 4e5, cacheRead: 4e6, output: 1e5 } })]);
+  const lines = humanReport(report).split("\n");
+  const line = lines.find((row) => row.startsWith("Cache reads are"));
+  assert.equal(line, "Cache reads are 78.4% of prompt tokens but 15% of estimated cost — a cache read bills at 0.1x the input rate.");
+  // The cost share is the same figure the line directly above it already prints,
+  // so the two cannot disagree by a rounding rule or by a denominator.
+  assert.match(lines.find((row) => row.startsWith("Cost by class:")), /cache-read \$1\.20 \(15%\)/);
+  assert.equal(lines.indexOf(line) - lines.findIndex((row) => row.startsWith("Cost by class:")), 1);
+
+  // The two share readings it replaces are gone from the text and unchanged in
+  // the JSON, where tags and other callers read them.
+  const text = humanReport(report);
+  assert.ok(!text.includes("Cache-read share:"));
+  assert.ok(!text.includes("output-cost share"));
+  assert.ok(Math.abs(report.insights.cacheReadShare - 4e6 / 5.1e6) < 1e-9);
+  assert.ok(Math.abs(report.insights.outputCostShare - 1.5 / 8.1) < 1e-9);
+
+  // With nothing priced there is no second share to set against the first, so
+  // the line says why rather than printing a 0%.
+  const unpriced = humanReport(buildReport([record({ model: "claude-internal-preview" })])).split("\n").find((row) => row.startsWith("Cache reads are"));
+  assert.equal(unpriced, "Cache reads are 50.0% of prompt tokens; nothing in this window is priced, so there is no cost share to set against that.");
+
+  // No prompt tokens at all is no line rather than a share of nothing.
+  assert.ok(!humanReport(buildReport([])).includes("Cache reads are"));
+});
+
+// Two 2-day windows: previous is 07-28..07-29 and current is 07-30..07-31, with
+// today (08-01) outside both. Sonnet 4.6 bills output at $15/M, Haiku 4.5 at
+// $5/M, and Opus 4.5 at $25/M, so every figure below is exact.
+function movedRecords() {
+  const turn = (day, model, project, output) => record({
+    messageId: `${day}-${model}-${project}`,
+    requestId: `${day}-${model}-${project}`,
+    timestamp: `2026-${day}T10:00:00Z`,
+    model,
+    project,
+    usage: { input: 0, cacheCreate: 0, cacheRead: 0, output },
+  });
+  return [
+    turn("07-28", "claude-sonnet-4-6", "p1", 1e6),
+    turn("07-30", "claude-sonnet-4-6", "p1", 3e6),
+    turn("07-28", "claude-haiku-4-5", "112233445566", 1e6),
+    turn("07-30", "claude-haiku-4-5", "112233445566", 2e5),
+    turn("07-28", "claude-opus-4-5", "p3", 1e5),
+    turn("07-30", "claude-opus-4-5", "p3", 1.2e5),
+  ];
+}
+
+test("humanReport names what moved when it is given a trend, and is untouched without one", () => {
+  const records = movedRecords();
+  const trend = analyzeTrend(records, { days: 2, now: new Date("2026-08-01T14:00:00Z") });
+  const labels = { 112233445566: "Payments API" };
+  const report = buildReport(records);
+  const lines = humanReport(report, labels, trend).split("\n");
+  const head = lines.findIndex((row) => row.startsWith("What changed:"));
+
+  // Directly under the run rate: "spend rose" and "here is what rose" are one
+  // reading, and the block states the two windows it compared.
+  assert.ok(lines[head - 1].startsWith("Run rate:"));
+  assert.equal(lines[head], "What changed: last 2 days vs previous 2 · $22.50 → $49.00 (117.8%)");
+  // Two a side, largest absolute move first, each delta carrying its direction.
+  // The opus row moved $0.50 and takes no slot from a row that moved $30.
+  assert.deepEqual(lines.slice(head + 1, head + 6), [
+    "  model    claude-sonnet-4-6            +$30.00",
+    "  model    claude-haiku-4-5             -$4.00",
+    "  project  p1                           +$30.00",
+    "  project  Payments API (112233445566)  -$4.00",
+    "  Where the money moved between those windows, not why it moved; compare tagged, matched task windows before attributing it to a change.",
+  ]);
+  assert.ok(!lines.some((row) => row.includes("claude-opus-4-5") && row.startsWith("  model")));
+  assert.ok(lines[head + 6].startsWith("Tokens:"));
+
+  // The trend is optional in both directions: the two-argument call is the same
+  // report it always was, and passing null explicitly is identical to omitting it.
+  const bare = humanReport(report, labels);
+  assert.ok(!bare.includes("What changed:"));
+  assert.equal(bare, humanReport(report, labels, null));
+  assert.equal(bare, humanReport(report, labels, undefined));
+  // Every other line is untouched; the block is the only difference.
+  assert.deepEqual(lines.filter((row) => !row.startsWith("What changed:") && !row.startsWith("  model ") && !row.startsWith("  project ") && !row.startsWith("  Where the money moved")), bare.split("\n"));
+
+  // An unlabelled project keeps its own id, and a caller with no labels file at
+  // all still gets the block.
+  assert.match(humanReport(report, {}, trend), /\n {2}project {2}112233445566 {17}-\$4\.00\n/);
+});
+
+test("a trend with nothing to compare prints no what-changed block at all", () => {
+  const now = new Date("2026-08-01T14:00:00Z");
+  const report = buildReport(movedRecords());
+  // A heading over an empty list is worse than silence: the terminal report is
+  // read top to bottom, and there is no section to leave standing.
+  assert.ok(!humanReport(report, {}, analyzeTrend([], { days: 2, now })).includes("What changed:"));
+  // One window of history and nothing before it: everything is a new arrival, so
+  // the deltas are real and the percentage has no base to be a share of.
+  const arriving = analyzeTrend([record({ timestamp: "2026-07-30T10:00:00Z", usage: { input: 0, cacheCreate: 0, cacheRead: 0, output: 1e6 } })], { days: 2, now });
+  const line = humanReport(report, {}, arriving).split("\n").find((row) => row.startsWith("What changed:"));
+  assert.equal(line, "What changed: last 2 days vs previous 2 · $0.00 → $15.00 (n/a)");
+});
+
+test("humanReport ranks projects and says once how an id gets a name", () => {
+  const turn = (id, project) => record({ messageId: id, requestId: id, project, usage: { input: 0, cacheCreate: 0, cacheRead: 0, output: 1e6 } });
+  const report = buildReport([turn("m1", "112233445566"), turn("m2", "112233445566"), turn("m3", "667788990011")]);
+  const labelled = humanReport(report, { 112233445566: "Payments API" });
+  const lines = labelled.split("\n");
+
+  // Between the models and the sessions: the "where" dimension, in the same
+  // column style as the rest of the report.
+  assert.ok(lines.indexOf("By model:") < lines.indexOf("By project:"));
+  assert.ok(lines.indexOf("By project:") < lines.indexOf("Top anonymous sessions:"));
+  assert.ok(lines.includes("  Payments API (112233445566)      $30.00     2,000,000 tokens  2 turns"));
+  // An id nobody has named prints as itself rather than as a blank.
+  assert.ok(lines.includes("  667788990011                     $15.00     1,000,000 tokens  1 turns"));
+  // The note belongs to the section that shows ids, and is printed once even
+  // though session rows carry a project too.
+  assert.equal(labelled.split("agent-finops label PROJECT_ID").length - 1, 1);
+  assert.match(labelled, /Project paths are never stored or printed\./);
+
+  // No labels at all is the backward-compatible default, and the same report.
+  const bare = humanReport(report);
+  assert.ok(!bare.includes("Payments API"));
+  assert.ok(bare.split("\n").includes("  112233445566                     $30.00     2,000,000 tokens  2 turns"));
+  assert.equal(bare.split("\n").length, labelled.split("\n").length);
+
+  // A report with no projects at all skips the section rather than heading an
+  // empty list; the note goes with it.
+  const legacy = humanReport({ ...report, topProjects: [] });
+  assert.ok(!legacy.includes("By project:"));
+  assert.ok(!legacy.includes("agent-finops label PROJECT_ID"));
+});
+
+test("a session row carries the project it ran under and the context it hauls per turn", () => {
+  const turn = (id, source, project, cacheRead) => record({ messageId: id, requestId: id, source, project, usage: { input: 0, cacheCreate: 0, cacheRead, output: 1e6 } });
+  const report = buildReport([
+    turn("m1", "aabbccddeeff", "112233445566", 300_000),
+    turn("m2", "aabbccddeeff", "112233445566", 300_000),
+    turn("m3", "ffeeddccbbaa", "667788990011", 12_000),
+    turn("m4", "0011aabb2233", null, 900),
+  ]);
+  const labels = { 112233445566: "Payments API" };
+  for (const rendered of [humanReport(report, labels), humanSessions(report.topSessions, labels)]) {
+    const lines = rendered.split("\n");
+    // The diagnosis, not just the number: this session is expensive and it is
+    // hauling a 300K context into every turn of one named project.
+    assert.ok(lines.includes("  aabbccddeeff      $30.18       2,600,000 tokens  2 turns  300K ctx/turn  project Payments API"));
+    // An unlabelled project is shortened on a session row: the row is about the
+    // session, and `projects` is where the full fingerprint is printed.
+    assert.ok(lines.includes("  ffeeddccbbaa      $15.00       1,012,000 tokens  1 turns  12K ctx/turn  project 667788"));
+    // A record with no project id leaves the session unattributed rather than
+    // inventing a project for it.
+    assert.ok(lines.includes("  0011aabb2233      $15.00       1,000,900 tokens  1 turns  900 ctx/turn  unattributed"));
+  }
+
+  // Both renderers take the label map as an optional second argument, so a
+  // caller that has no labels file passes nothing and still gets every column.
+  for (const rendered of [humanReport(report), humanSessions(report.topSessions)]) {
+    assert.ok(!rendered.includes("Payments API"));
+    assert.ok(rendered.split("\n").includes("  aabbccddeeff      $30.18       2,600,000 tokens  2 turns  300K ctx/turn  project 112233"));
+  }
+  assert.equal(humanSessions([]), "No sessions found in this period.");
+  assert.match(humanSessions(report.topSessions), /compare-sessions A B/);
 });
 
 test("a session carries the project it ran under and the context it hauls per turn", () => {
@@ -354,46 +616,88 @@ test("model concentration is called out only once one model owns half the spend"
 test("output-cost and the cache share fallback follow their own thresholds", () => {
   assert.deepEqual(kinds(analyzable({ insights: { outputCostShare: 0.1499, cacheReadShare: null } })), []);
   assert.deepEqual(kinds(analyzable({ insights: { outputCostShare: 0.15, cacheReadShare: null } })), ["output-cost:medium"]);
-  // With nothing priced there are no cache dollars to compare, so the token
-  // share is what remains. Cache is always reported when it is measurable; only
-  // its severity moves, because caching that pays for itself is a reason not to
-  // change TTL policy.
-  assert.deepEqual(kinds(analyzable({ insights: { outputCostShare: null, cacheReadShare: 0.79 } })), ["cache:medium"]);
-  assert.deepEqual(kinds(analyzable({ insights: { outputCostShare: null, cacheReadShare: 0.8 } })), ["cache:info"]);
+  // With no per-class dollars there is nothing to weigh the cache bill against,
+  // so the token share is the only reading available and is always printed.
+  // Only its severity moves.
+  assert.deepEqual(kinds(analyzable({ insights: { outputCostShare: null, cacheReadShare: 0.79 } })), ["cache-efficiency:medium"]);
+  assert.deepEqual(kinds(analyzable({ insights: { outputCostShare: null, cacheReadShare: 0.8 } })), ["cache-efficiency:info"]);
   assert.match(humanHotspots(hotspotAnalysis(analyzable({ insights: { outputCostShare: null, cacheReadShare: 0.9 } }))), /net positive on tokens/);
 });
 
-// Once dollars exist the cache verdict is an economic one, not a token share:
-// reads are billed at a tenth of the input rate, so the same tokens uncached
-// would have cost ten times as much and the saving is the other nine tenths.
-function cacheReport({ cacheWrite, cacheRead, cacheWrite1hShare = null, cacheReadShare = 0.5 }) {
+// The cache question worth asking is which TTL the write was bought at, not what
+// the reads would have cost uncached: a read is a tenth of the input rate and an
+// agent re-reads its context every turn, so that comparison is favourable in
+// every window and says nothing about any particular one.
+function cacheReport({ cacheWrite, cacheWrite1h, totalUsd = 100, cacheRead = 0, cacheReadShare = 0.5 }) {
   return analyzable({
-    total: { usd: 100, usdByClass: { input: 0, cacheWrite, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead, output: 0 } },
-    insights: { outputCostShare: null, cacheReadShare, cacheWrite1hShare },
+    total: { usd: totalUsd, usdByClass: { input: 0, cacheWrite, cacheWrite1h, cacheWrite5m: cacheWrite - cacheWrite1h, cacheRead, output: 0 } },
+    insights: { outputCostShare: null, cacheReadShare, cacheWrite1hShare: cacheWrite ? cacheWrite1h / cacheWrite : null },
   });
 }
 
-test("cache economics compares write cost against what reads saved", () => {
-  const positive = hotspotAnalysis(cacheReport({ cacheWrite: 10, cacheRead: 5 })).recommendations[0];
-  assert.equal(positive.kind, "cache");
-  assert.equal(positive.severity, "info");
-  // $5 of reads would have been $50 uncached, so the saving is $45 against $10.
-  assert.match(positive.evidence, /Cache writes cost \$10\.00 and saved ≈ \$45\.00 against uncached reads/);
-  assert.match(positive.action, /net positive/);
+test("cache-ttl states the TTL tradeoff and prices only the 1-hour premium", () => {
+  // $40 of $50 in cache writes bought at the 1-hour rate; the same tokens at the
+  // 5-minute rate would be 1 - 1.25/2 = 37.5% less, so $15.
+  const finding = hotspotAnalysis(cacheReport({ cacheWrite: 50, cacheWrite1h: 40 })).recommendations[0];
+  assert.equal(finding.kind, "cache-ttl");
+  assert.ok(Math.abs(finding.estimatedSavingsUsd - 15) < 1e-9);
+  assert.match(finding.evidence, /Cache writes are 50\.0% of estimated spend \(\$50\.00\), of which 80\.0% \(\$40\.00\) was bought at the 1-hour rate \(2x input\) rather than the 5-minute rate \(1\.25x\)/);
+  assert.match(finding.evidence, /would be \$15\.00 less — an upper bound/);
+  // Both directions, because this is a genuine tradeoff and not a defect: the
+  // action must not read as "turn the 1-hour writes off".
+  assert.match(finding.action, /tradeoff, not a defect/);
+  assert.match(finding.action, /1-hour TTL costs 60% more per write/);
+  assert.match(finding.action, /re-written in full, and one re-write costs more than the premium it saved/);
+  assert.match(finding.action, /session cadence/);
 
-  const negative = hotspotAnalysis(cacheReport({ cacheWrite: 50, cacheRead: 5, cacheWrite1hShare: 0.62 })).recommendations[0];
-  assert.equal(negative.severity, "medium");
-  assert.match(negative.evidence, /Cache writes cost \$50\.00 against ≈ \$45\.00 saved on reads/);
-  // 1-hour writes are named only when they dominate the write bill.
-  assert.match(negative.evidence, /1-hour writes are 62\.0% of that write cost/);
-  assert.ok(!hotspotAnalysis(cacheReport({ cacheWrite: 50, cacheRead: 5, cacheWrite1hShare: 0.2 })).recommendations[0].evidence.includes("1-hour writes"));
-  assert.match(negative.action, /session restarts/);
+  // Severity is the size of the cache bill, not the size of the premium: above
+  // 35% of spend it is worth acting on, at or below it is worth understanding.
+  assert.equal(finding.severity, "medium", "cache writes are 50% of spend here");
+  assert.equal(hotspotAnalysis(cacheReport({ cacheWrite: 35, cacheWrite1h: 30 })).recommendations[0].severity, "info");
+  assert.equal(hotspotAnalysis(cacheReport({ cacheWrite: 36, cacheWrite1h: 30 })).recommendations[0].severity, "medium");
 
-  // A high read share does not overrule the dollars: reads can dominate the
-  // token mix while the writes that produced them cost more than they recover.
-  assert.deepEqual(kinds(cacheReport({ cacheWrite: 50, cacheRead: 5, cacheReadShare: 0.95 })), ["cache:medium"]);
-  // Cents on both sides are an ordering, not money; the share reading returns.
-  assert.match(hotspotAnalysis(cacheReport({ cacheWrite: 0.5, cacheRead: 0.01, cacheReadShare: 0.9 })).recommendations[0].evidence, /Cache reads are 90\.0% of prompt tokens/);
+  // Non-triggers: a premium too small to be money, and a write bill that is
+  // mostly 5-minute writes already.
+  assert.deepEqual(kinds(cacheReport({ cacheWrite: 50, cacheWrite1h: 9.99, cacheReadShare: null })), []);
+  assert.deepEqual(kinds(cacheReport({ cacheWrite: 70, cacheWrite1h: 34.99, cacheReadShare: null })), []);
+  assert.deepEqual(kinds(cacheReport({ cacheWrite: 70, cacheWrite1h: 35, cacheReadShare: null })), ["cache-ttl:medium"]);
+});
+
+test("the always-positive uncached-read counterfactual is gone from every cache finding", () => {
+  // It was the verdict of every agent workload — writes always look cheap beside
+  // ten times the read bill — so it ranked nothing and decided nothing.
+  const reports = [
+    cacheReport({ cacheWrite: 50, cacheWrite1h: 40, cacheRead: 500 }),
+    cacheReport({ cacheWrite: 90, cacheWrite1h: 5, cacheRead: 500, cacheReadShare: 0.95 }),
+    analyzable({ insights: { outputCostShare: null, cacheReadShare: 0.9 } }),
+  ];
+  for (const report of reports) {
+    const rendered = JSON.stringify(hotspotAnalysis(report).recommendations);
+    assert.ok(!rendered.includes("against uncached reads"), "the uncached-read counterfactual survived");
+    assert.ok(!rendered.includes("saved on reads"), "the uncached-read counterfactual survived");
+    assert.ok(!/"kind":"cache"/.test(rendered), "the old undifferentiated cache kind survived");
+  }
+});
+
+test("cache-efficiency is the fallback only when the TTL split cannot speak", () => {
+  // Mostly 5-minute writes, but the cache bill is still most of the spend: the
+  // token share is the reading that remains, and it carries no savings figure
+  // because a read share is not a counterfactual.
+  const fallback = hotspotAnalysis(cacheReport({ cacheWrite: 90, cacheWrite1h: 5, cacheReadShare: 0.95 })).recommendations[0];
+  assert.equal(fallback.kind, "cache-efficiency");
+  assert.equal(fallback.severity, "info");
+  assert.equal(fallback.estimatedSavingsUsd, null);
+  assert.match(fallback.evidence, /Cache reads are 95\.0% of prompt tokens/);
+
+  // Below a large share of spend the cache bill is not what this window is about,
+  // and a reading nobody can act on is noise.
+  assert.deepEqual(kinds(cacheReport({ cacheWrite: 34.99, cacheWrite1h: 0, cacheReadShare: 0.95 })), []);
+  assert.deepEqual(kinds(cacheReport({ cacheWrite: 35, cacheWrite1h: 0, cacheReadShare: 0.95 })), ["cache-efficiency:info"]);
+  // Nothing priced: there are no dollars to take a share of, so the token share
+  // is printed on its own rather than suppressed.
+  assert.deepEqual(kinds(cacheReport({ cacheWrite: 0, cacheWrite1h: 0, totalUsd: 0, cacheReadShare: 0.5 })), ["cache-efficiency:medium"]);
+  // The TTL finding wins outright when it fires; the two never both appear.
+  assert.deepEqual(kinds(cacheReport({ cacheWrite: 50, cacheWrite1h: 40, cacheReadShare: 0.95 })), ["cache-ttl:medium"]);
 });
 
 test("model concentration re-prices the same tokens at the cheaper sibling's rate", () => {
@@ -413,13 +717,21 @@ test("model concentration re-prices the same tokens at the cheaper sibling's rat
   const repriced = hotspotAnalysis(analyzable({ total: { usd: opusUsd }, byModel: { "claude-opus-5": { usd: opusUsd, usage: mixed } } })).recommendations[0];
   assert.match(repriced.evidence, new RegExp(`≈ \\$${(opusUsd - sonnetUsd).toFixed(2)} less`));
 
+  // The same difference is what the finding is ranked by, so the number in the
+  // sentence and the number in the field are one calculation, not two.
+  assert.equal(finding.estimatedSavingsUsd, 10);
+  assert.ok(Math.abs(repriced.estimatedSavingsUsd - (opusUsd - sonnetUsd)) < 1e-9);
+
   // Haiku is the bottom of the ladder, so the share is still reported and the
   // counterfactual is simply absent rather than invented.
   const haiku = hotspotAnalysis(analyzable({ total: { usd: 25 }, byModel: { "claude-haiku-4-5": { usd: 25, usage } } })).recommendations[0];
   assert.equal(haiku.kind, "model-concentration");
   assert.ok(!haiku.evidence.includes("Re-pricing"));
+  assert.equal(haiku.estimatedSavingsUsd, null, "no sibling means no defensible saving, not a saving of zero");
   // An aggregate with no token counts cannot be re-priced at all.
-  assert.ok(!hotspotAnalysis(analyzable({ total: { usd: 25 }, byModel: { "claude-opus-5": { usd: 25 } } })).recommendations[0].evidence.includes("Re-pricing"));
+  const noTokens = hotspotAnalysis(analyzable({ total: { usd: 25 }, byModel: { "claude-opus-5": { usd: 25 } } })).recommendations[0];
+  assert.ok(!noTokens.evidence.includes("Re-pricing"));
+  assert.equal(noTokens.estimatedSavingsUsd, null);
 });
 
 test("context bloat names one session, and only when the context is both large and expensive", () => {
@@ -428,17 +740,76 @@ test("context bloat names one session, and only when the context is both large a
   assert.deepEqual(kinds(analyzable({ topSessions: [session("aabbccddeeff", 150_000, 4.99)] })), []);
 
   // Severity is the session's share of the window, not its absolute cost. Above
-  // $10 the session-outlier rule fires on the same row, which is the point:
-  // one says the session is expensive, the other says the context is why.
-  assert.deepEqual(kinds(analyzable({ topSessions: [session("aabbccddeeff", 150_000, 19.99)] })), ["session-outlier:medium", "context-bloat:medium"]);
+  // $10 the session-outlier rule would also fire on this row; it is suppressed,
+  // because two findings naming one session read as two problems.
+  assert.deepEqual(kinds(analyzable({ topSessions: [session("aabbccddeeff", 150_000, 19.99)] })), ["context-bloat:medium"]);
   assert.deepEqual(kinds(analyzable({ topSessions: [session("aabbccddeeff", 150_000, 5)] })), ["context-bloat:medium"]);
   const worst = hotspotAnalysis(analyzable({ topSessions: [session("aabbccddeeff", 210_000, 61, 42), session("ffeeddccbbaa", 300_000, 30)] }));
-  assert.deepEqual(worst.recommendations.map((item) => `${item.kind}:${item.severity}`), ["session-outlier:medium", "context-bloat:high"]);
+  assert.deepEqual(worst.recommendations.map((item) => `${item.kind}:${item.severity}`), ["context-bloat:high"]);
   // One row, for the costliest offender, however many sessions qualify.
   assert.equal(worst.recommendations.filter((item) => item.kind === "context-bloat").length, 1);
-  const bloat = worst.recommendations.find((item) => item.kind === "context-bloat");
+  const bloat = worst.recommendations[0];
+  // No per-class dollars on this bucket, so no counterfactual is invented.
+  assert.equal(bloat.estimatedSavingsUsd, null);
   assert.equal(bloat.evidence, "Session aabbccddeeff averaged 210K prompt tokens per turn across 42 turn(s) (≈$61.00).");
   assert.match(bloat.action, /compact earlier/);
+});
+
+test("context bloat prices a capped context by scaling the session's cache reads", () => {
+  // Cache reads are the context re-billed every turn, so a prompt held to half
+  // its size re-bills half of them: $24 of reads at 300K average against a 150K
+  // target is $12.
+  const bloated = (avgPromptTokens, cacheRead) => analyzable({
+    topSessions: [{ id: "aabbccddeeff", avgPromptTokens, usd: 40, requests: 20, usdByClass: { input: 4, cacheWrite: 6, cacheWrite1h: 0, cacheWrite5m: 6, cacheRead, output: 6 } }],
+  });
+  const half = hotspotAnalysis(bloated(300_000, 24)).recommendations[0];
+  assert.equal(half.kind, "context-bloat");
+  assert.ok(Math.abs(half.estimatedSavingsUsd - 12) < 1e-9);
+  assert.match(half.evidence, /Holding the average prompt to 150K would re-bill its cache reads in proportion, ≈\$12\.00 less/);
+  // Stated as a ceiling: the same work has to fit in the smaller context for it.
+  assert.match(half.evidence, /an upper bound that assumes the same work fits in the smaller context/);
+
+  // Only the excess over the target is claimed, never the whole read bill.
+  const quarter = hotspotAnalysis(bloated(200_000, 24)).recommendations[0];
+  assert.ok(Math.abs(quarter.estimatedSavingsUsd - 6) < 1e-9);
+  // Exactly at the target there is nothing to cut, and the figure is 0 rather
+  // than a negative saving.
+  assert.equal(hotspotAnalysis(bloated(150_000, 24)).recommendations[0].estimatedSavingsUsd, 0);
+  // A session with no cache reads carries no priced context to shrink.
+  assert.equal(hotspotAnalysis(bloated(300_000, 0)).recommendations[0].estimatedSavingsUsd, 0);
+
+  // A tag snapshot taken before per-class dollars existed cannot be scaled, and
+  // guessing which part of its estimate was cache reads would invent the number
+  // the finding is ranked by. The finding still fires, unquantified.
+  const legacy = hotspotAnalysis(analyzable({ topSessions: [{ id: "aabbccddeeff", avgPromptTokens: 300_000, usd: 40, requests: 20 }] })).recommendations[0];
+  assert.equal(legacy.kind, "context-bloat");
+  assert.equal(legacy.estimatedSavingsUsd, null);
+  assert.ok(!legacy.evidence.includes("Holding the average prompt"));
+});
+
+test("session-outlier fires only for an expensive session context bloat has not already claimed", () => {
+  // Heavy per-turn context: context-bloat is the more specific diagnosis and the
+  // only one raised, so the two rules never point at one session twice.
+  const heavy = analyzable({ topSessions: [{ id: "aabbccddeeff", usd: 30, requests: 12, avgPromptTokens: 400_000 }] });
+  assert.deepEqual(kinds(heavy), ["context-bloat:high"]);
+
+  // Normal per-turn context and the same money: a different diagnosis entirely —
+  // many turns rather than heavy ones — and the evidence has to say which.
+  const many = hotspotAnalysis(analyzable({ topSessions: [{ id: "aabbccddeeff", usd: 30, requests: 240, avgPromptTokens: 42_500 }] })).recommendations[0];
+  assert.equal(many.kind, "session-outlier");
+  assert.equal(many.estimatedSavingsUsd, null);
+  assert.match(many.evidence, /cost \$30\.00 across 240 turn\(s\), averaging 42,500 prompt tokens per turn/);
+  assert.match(many.evidence, /under the 150K context-bloat threshold, so this session is expensive for how many turns it ran rather than how heavy each one was/);
+  assert.match(many.action, /turn count and workflow/);
+
+  // Both can still appear, on different sessions: the top session is expensive
+  // for its turn count and a cheaper one below it is expensive for its context.
+  assert.deepEqual(kinds(analyzable({
+    topSessions: [
+      { id: "aabbccddeeff", usd: 30, requests: 240, avgPromptTokens: 42_500 },
+      { id: "ffeeddccbbaa", usd: 12, requests: 6, avgPromptTokens: 400_000 },
+    ],
+  })), ["session-outlier:medium", "context-bloat:medium"]);
 });
 
 test("session and MCP outliers need real money before they are raised", () => {
@@ -465,11 +836,41 @@ test("an expensive Bash cohort points at the local output filter and quotes it o
   assert.ok(!bare.evidence.includes("already removed"));
   assert.match(bare.action, /agent-finops hook-config/);
   assert.match(bare.action, /agent-finops filter-report/);
+  // Nothing was measured, so the finding is an unquantified nudge rather than a
+  // saving of zero — and it ranks below anything that carries a figure.
+  assert.equal(bare.estimatedSavingsUsd, null);
 
   const measured = hotspotAnalysis(withBash(40), { filterStats: { events: 9, rawChars: 500_000, sentChars: 100_000, savedChars: 400_000, estimatedTokensSaved: 100_000 } }).recommendations[0];
   assert.match(measured.evidence, /already removed ~100,000 input tokens across 9 filtered result\(s\)/);
   // A ledger that exists but has removed nothing has nothing to report.
-  assert.ok(!hotspotAnalysis(withBash(40), { filterStats: { events: 0, savedChars: 0, estimatedTokensSaved: 0 } }).recommendations[0].evidence.includes("already removed"));
+  const empty = hotspotAnalysis(withBash(40), { filterStats: { events: 0, savedChars: 0, estimatedTokensSaved: 0 } }).recommendations[0];
+  assert.ok(!empty.evidence.includes("already removed"));
+  assert.equal(empty.estimatedSavingsUsd, null);
+});
+
+test("filter savings are priced as the cache write those tokens would have been", () => {
+  // Removed output never enters the context, so it is priced as a cache write at
+  // the window's dominant model rate: 100K tokens at sonnet-4-6's $3/M input,
+  // charged at the conservative 5-minute multiplier of 1.25x, is $0.375.
+  const stats = { events: 9, rawChars: 500_000, sentChars: 100_000, savedChars: 400_000, estimatedTokensSaved: 100_000 };
+  const withModel = (model) => analyzable({
+    // Under half the spend, so this fixture raises no model-concentration row.
+    byModel: { [model]: { usd: 40 } },
+    topTools: [{ name: "Bash", usd: 40, followOnRequests: 12 }],
+  });
+  const priced = hotspotAnalysis(withModel("claude-sonnet-4-6"), { filterStats: stats }).recommendations[0];
+  assert.equal(priced.kind, "bash-output-filter");
+  assert.ok(Math.abs(priced.estimatedSavingsUsd - 0.375) < 1e-9);
+  assert.match(priced.evidence, /At claude-sonnet-4-6 cache-write rates that is ≈\$0\.38 of context never bought/);
+
+  // A dominant model with no local rate cannot price anything, and the finding
+  // reports the tokens removed without inventing a dollar figure for them.
+  const unpriced = hotspotAnalysis(withModel("claude-internal-preview"), { filterStats: stats }).recommendations[0];
+  assert.equal(unpriced.estimatedSavingsUsd, null);
+  assert.match(unpriced.evidence, /already removed ~100,000 input tokens/);
+  assert.ok(!unpriced.evidence.includes("cache-write rates"));
+  // No model at all in the window is the same answer.
+  assert.equal(hotspotAnalysis(analyzable({ topTools: [{ name: "Bash", usd: 40, followOnRequests: 12 }] }), { filterStats: stats }).recommendations[0].estimatedSavingsUsd, null);
 });
 
 test("spend acceleration is raised only with a trend, a real jump, and real money", () => {
@@ -501,4 +902,94 @@ test("a report with nothing over a threshold says so instead of inventing advice
   assert.equal(humanHotspots(hotspotAnalysis(analyzable())), "No cost hotspots found in this period.");
   // Extras are optional in both directions: empty ones read like none at all.
   assert.equal(humanHotspots(hotspotAnalysis(analyzable(), {})), "No cost hotspots found in this period.");
+});
+
+// A window with five findings across the whole severity range, chosen so that
+// the ranking cannot be satisfied by rule order, by severity, or by either one
+// alone. Ranking by what acting is worth is the point of the list.
+function rankable() {
+  return analyzable({
+    total: { usd: 100, usdByClass: { input: 0, cacheWrite: 30, cacheWrite1h: 24, cacheWrite5m: 6, cacheRead: 0, output: 0 } },
+    // 2.4M output tokens cost $60 on opus-5 and $36 on sonnet-5: a $24 what-if.
+    byModel: { "claude-opus-5": { usd: 60, usage: { input: 0, cacheCreate: 0, cacheCreate1h: 0, cacheCreate5m: 0, cacheRead: 0, output: 2.4e6, total: 2.4e6 } } },
+    topSessions: [{ id: "aabbccddeeff", usd: 20, requests: 100, avgPromptTokens: 50_000 }],
+    topTools: [{ name: "mcp__issues__search", usd: 25, followOnRequests: 5 }],
+    insights: { outputCostShare: 0.2, cacheReadShare: null, cacheWrite1hShare: 0.8 },
+  });
+}
+
+test("recommendations are ranked by estimated savings, with the unquantified ones last", () => {
+  const analysis = hotspotAnalysis(rankable());
+  assert.deepEqual(analysis.recommendations.map((item) => item.kind), [
+    // $24, then $9: dollars decide the top of the list.
+    "model-concentration",
+    "cache-ttl",
+    // Nothing below here has a defensible counterfactual. `mcp-follow-on-cost`
+    // is the last rule of the three to run and the first of them to print,
+    // because among unquantified findings severity is the tie-break.
+    "mcp-follow-on-cost",
+    // Then rule order, which is what separates two medium/unquantified rows.
+    "output-cost",
+    "session-outlier",
+  ]);
+  assert.deepEqual(analysis.recommendations.map((item) => item.severity), ["high", "info", "high", "medium", "medium"]);
+  assert.deepEqual(analysis.recommendations.map((item) => item.estimatedSavingsUsd), [24, 9, null, null, null]);
+  // The headline figure sums only what was quantified.
+  assert.equal(analysis.totalEstimatedSavingsUsd, 33);
+  // Null is "no defensible counterfactual", never zero: it must not be summed
+  // in, and it must not sort as if it were the cheapest quantified finding.
+  assert.ok(analysis.recommendations.slice(2).every((item) => item.estimatedSavingsUsd === null));
+});
+
+test("equal savings are separated by severity, not by the order the rules ran", () => {
+  // $32 of 1-hour writes is a $12 premium, and $24 of session cache reads at a
+  // 300K average against the 150K target is also $12. The cache rule runs first
+  // and is `info`; the context rule runs later and is `high`, so a correct
+  // ranking prints them in the opposite order to the rules.
+  const analysis = hotspotAnalysis(analyzable({
+    total: { usd: 100, usdByClass: { input: 0, cacheWrite: 32, cacheWrite1h: 32, cacheWrite5m: 0, cacheRead: 0, output: 0 } },
+    topSessions: [{ id: "aabbccddeeff", usd: 20, requests: 5, avgPromptTokens: 300_000, usdByClass: { input: 0, cacheWrite: 0, cacheWrite1h: 0, cacheWrite5m: 0, cacheRead: 24, output: 0 } }],
+    insights: { outputCostShare: null, cacheReadShare: null, cacheWrite1hShare: 1 },
+  }));
+  assert.deepEqual(analysis.recommendations.map((item) => `${item.kind}:${item.severity}`), ["context-bloat:high", "cache-ttl:info"]);
+  for (const item of analysis.recommendations) assert.ok(Math.abs(item.estimatedSavingsUsd - 12) < 1e-9);
+  assert.ok(Math.abs(analysis.totalEstimatedSavingsUsd - 24) < 1e-9);
+});
+
+test("humanHotspots leads with the ranking headline and prints each figure inline", () => {
+  const rendered = humanHotspots(hotspotAnalysis(rankable()));
+  const lines = rendered.split("\n");
+  assert.equal(lines[0], "agent-finops hotspots");
+  assert.equal(lines[1], "Ranked by estimated upper-bound savings · $33.00 total across 2 quantified findings");
+  // Each quantified finding carries its own figure in its heading line; the
+  // unquantified ones print exactly as before.
+  assert.ok(rendered.includes("[high] model-concentration · up to $24.00"));
+  assert.ok(rendered.includes("[info] cache-ttl · up to $9.00"));
+  assert.ok(rendered.includes("[high] mcp-follow-on-cost\n"));
+  assert.ok(!rendered.includes("mcp-follow-on-cost ·"));
+  // The evidence/action structure is unchanged.
+  assert.match(rendered, /\n {2}Evidence: claude-opus-5 is 60\.0% of estimated spend\./);
+  assert.match(rendered, /\n {2}Next: Run a tagged, comparable task set/);
+  // Estimate, never invoice — and a ceiling on this window, not a forecast.
+  assert.match(rendered, /a local estimate from list prices, not a bill/);
+  assert.match(rendered, /upper bounds on this same workload .* not a forecast/);
+
+  // One quantified finding is a singular headline.
+  assert.match(humanHotspots(hotspotAnalysis(analyzable({ total: { usd: 100, usdByClass: { input: 0, cacheWrite: 40, cacheWrite1h: 40, cacheWrite5m: 0, cacheRead: 0, output: 0 } }, insights: { outputCostShare: null, cacheReadShare: null } }))), /\$15\.00 total across 1 quantified finding\n/);
+});
+
+test("humanHotspots omits the headline when nothing in the window can be quantified", () => {
+  const analysis = hotspotAnalysis(analyzable({
+    topSessions: [{ id: "aabbccddeeff", usd: 30, requests: 240, avgPromptTokens: 42_500 }],
+    insights: { outputCostShare: 0.2, cacheReadShare: null },
+  }));
+  assert.equal(analysis.totalEstimatedSavingsUsd, 0);
+  const lines = humanHotspots(analysis).split("\n");
+  assert.equal(lines[0], "agent-finops hotspots");
+  // Straight into the findings: a "$0.00 total" headline would read as a verdict
+  // that there is nothing to save, rather than nothing this tool can price.
+  assert.equal(lines[1], "");
+  assert.equal(lines[2], "[medium] output-cost");
+  assert.ok(!lines.some((line) => line.startsWith("Ranked by")));
+  assert.ok(!lines.some((line) => line.includes("up to $")));
 });

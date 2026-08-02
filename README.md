@@ -148,17 +148,40 @@ because no window can hold it.
 
 - total, daily, and per-model input/cache-write/cache-read/output tokens;
 - local USD estimate, including each cache class;
-- cache-read share and output-cost share;
-- top anonymous sessions by cost; and
+- a run rate: spend per *active* day (a day with records, not a day of the
+  calendar span), what that pace comes to over 30 days, and the peak day when it
+  cost at least twice the median one;
+- one line setting the cache-read share of prompt *tokens* against its share of
+  the *dollars*, since a cache read bills at 0.1x input and the two figures look
+  like a contradiction until both denominators are named;
+- the median/mean/p90 cost of a turn;
+- a `What changed:` block naming the models and projects whose dollars moved
+  most between the last seven complete days and the seven before them, when
+  there is enough history to compare two windows;
+- top projects by cost, named by their local label where one exists;
+- top anonymous sessions by cost, each with the project it ran under and the
+  average context it carries per turn; and
 - safe tool/MCP names with their immediate follow-on turn estimate; and
 - warnings for unpriced models and incomplete dedup keys.
+
+The projection is a pace on the workload that already ran — what 30 days like
+these would cost — never a forecast of the next 30, and never a bill.
 
 ## Local dashboard
 
 Run `agent-finops dashboard --since 30d` and open the loopback URL it prints.
 The command keeps running until `Ctrl-C`. The page visualizes daily spend, model
-concentration, tool/MCP cohorts, anonymous sessions, cache/output shares, and
-the evidence-backed cost-reduction experiments from `hotspots`.
+concentration, tool/MCP cohorts, anonymous sessions, projects, and the
+evidence-backed cost-reduction experiments from `hotspots`. Its four readings are
+token volume, run rate, the identified savings those experiments add up to, and
+the cost of a turn.
+
+Between the readings and the ranked breakdown, a *what changed* section names the
+three models and three projects whose dollars moved most between the last seven
+complete UTC days and the seven before them — the same trend `hotspots` reads, so
+the page and its findings cannot describe different windows. It is descriptive:
+where the money moved, not why it moved. Only the deltas travel to the browser,
+already named by their local label, never the two underlying reports.
 
 It binds exclusively to `127.0.0.1` (never the LAN), serves no API, has no
 external assets or browser connections, and receives only aggregate metadata
@@ -175,7 +198,15 @@ anonymous local project id, and `project ID` reports one of them on its own. If
 you want readable names, add an explicit local label with `label`; labels store
 only the id and your chosen name, never a path.
 
-`hotspots` turns those metrics into evidence-backed next experiments. `tag` and
+`hotspots` turns those metrics into evidence-backed next experiments, ranked by
+what acting on each one is estimated to be worth. A finding carries an
+`estimatedSavingsUsd` upper bound wherever a counterfactual can be defended —
+re-pricing the top model's own tokens at its cheaper sibling's rate, re-pricing
+1-hour cache writes at the 5-minute rate, scaling a bloated session's cache
+reads to a smaller prompt, or pricing the output the local filter already
+removed — and reports no figure at all where one cannot be, rather than
+inventing it. The figures are ceilings on the window that already happened, not
+forecasts, and never a claim about a bill. `tag` and
 `compare` create private snapshots so changes such as Boost, a custom terminal
 filter, a cache policy, or a routing rule can be evaluated against comparable
 time windows. The comparison is descriptive: it does not pretend that two

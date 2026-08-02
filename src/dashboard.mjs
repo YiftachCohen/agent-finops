@@ -32,7 +32,55 @@ function usdByClassOf(usdByClass = {}) {
   };
 }
 
-function dashboardPayload(report, analysis, labels) {
+/**
+ * What the ranked findings are worth in total, and how many rows carry a figure.
+ * The analysis already computes the sum; it is recomputed here only for an
+ * analysis built before that field existed, so an older tag-shaped payload reads
+ * as a real zero rather than a missing one. Never a total of the window: it sums
+ * only the findings a counterfactual could be defended for.
+ */
+function savingsOf(analysis) {
+  const quantified = (analysis?.recommendations || []).filter((item) => item.estimatedSavingsUsd != null);
+  return {
+    totalUsd: analysis?.totalEstimatedSavingsUsd ?? quantified.reduce((sum, item) => sum + item.estimatedSavingsUsd, 0),
+    quantifiedFindings: quantified.length,
+  };
+}
+
+// Three rows a side. Past that the deltas are usually rounding against the
+// headline, and the section stops being an answer to "what changed".
+const CHANGED_ROW_LIMIT = 3;
+
+/** A 12-hex fingerprint shortened the way a session row shortens it; anything
+ * else — the `<unknown-project>` bucket — is left alone, because truncating it
+ * produces a word rather than an id. */
+function shortProjectId(id) {
+  return /^[a-f0-9]{12}$/i.test(id) ? id.slice(0, 6) : id;
+}
+
+/**
+ * The two windows `analyzeTrend` compared, reduced to what the page draws: the
+ * model and project rows whose dollars moved most, each already named. The two
+ * nested reports stay on this side of the wire — the page needs the deltas, not
+ * a second copy of every bucket — and a project delta is resolved to its local
+ * label here, so no fingerprint has to travel for the row to be readable.
+ *
+ * Null when the caller has no trend at all, which is what a too-short history
+ * produces; the page renders its empty state rather than hiding the section.
+ */
+function changedOf(trend, labels) {
+  if (!trend) return null;
+  const rows = (list, name) => list.slice(0, CHANGED_ROW_LIMIT).map((row) => ({ name: name(row), deltaUsd: row.deltaUsd }));
+  return {
+    days: trend.days,
+    current: { start: trend.current?.start || null, end: trend.current?.end || null },
+    previous: { start: trend.previous?.start || null, end: trend.previous?.end || null },
+    byModel: rows(trend.drivers?.byModel || [], (row) => String(row.model)),
+    byProject: rows(trend.drivers?.byProject || [], (row) => labels[row.id] || shortProjectId(String(row.id))),
+  };
+}
+
+function dashboardPayload(report, analysis, labels, trend) {
   return {
     generatedAt: report.generatedAt,
     // Only the scan timestamp, never the index path: the page is a screenshot
@@ -87,7 +135,15 @@ function dashboardPayload(report, analysis, labels) {
       usage: usageOf(project.usage),
       requests: project.requests,
     })),
-    recommendations: analysis.recommendations.map(({ severity, kind, evidence, action }) => ({ severity, kind, evidence, action })),
+    // `estimatedSavingsUsd` is the order this list already arrives in. Absent on
+    // an analysis built before it existed, where it falls back to null and the
+    // row simply prints no figure rather than a zero it cannot support.
+    recommendations: analysis.recommendations.map(({ severity, kind, evidence, action, estimatedSavingsUsd }) => ({ severity, kind, evidence, action, estimatedSavingsUsd: estimatedSavingsUsd ?? null })),
+    // The headline the ranked list adds up to, promoted to a reading: it is the
+    // one number on this page that is a decision rather than a description.
+    savings: savingsOf(analysis),
+    // Aggregate deltas only: window dates, names, and dollars.
+    changed: changedOf(trend, labels),
   };
 }
 
@@ -112,9 +168,13 @@ function embeddedJson(value) {
  * user-authored and hold no path, so they are safe on the loopback page — but
  * they are still text from a file, so they travel through `embeddedJson` and
  * are written with `textContent` like every other value here.
+ *
+ * `trend` is an optional `analyzeTrend` result. Only its per-key deltas reach
+ * the page, through `changedOf`; a caller without one renders the same page with
+ * the "what changed" section in its empty state.
  */
-export function renderDashboard(report, analysis, labels = {}) {
-  const data = embeddedJson(dashboardPayload(report, analysis, labels || {}));
+export function renderDashboard(report, analysis, labels = {}, trend = null) {
+  const data = embeddedJson(dashboardPayload(report, analysis, labels || {}, trend));
   // Instrument Serif and DM Mono cannot be loaded from Google Fonts here: the
   // page ships under default-src 'none' and the privacy audit forbids any URL
   // in src/. The stacks below use them when installed locally and fall back to
@@ -237,7 +297,7 @@ export function renderDashboard(report, analysis, labels = {}) {
     .switcher button:focus-visible { outline:0; border-color:var(--attn); color:var(--ink); }
 
     /* Signals: severity reads as ink brightness, not colour. */
-    .note { display:grid; grid-template-columns:34px minmax(0,1fr) 66px; align-items:baseline; gap:clamp(10px,1.6vw,20px); border-bottom:1px solid var(--line); padding:clamp(12px,1.4vw,17px) 0; transition:border-color 400ms var(--ease); }
+    .note { display:grid; grid-template-columns:34px minmax(0,1fr) 76px; align-items:baseline; gap:clamp(10px,1.6vw,20px); border-bottom:1px solid var(--line); padding:clamp(12px,1.4vw,17px) 0; transition:border-color 400ms var(--ease); }
     /* The section rule below already closes the stack; two would read double. */
     .note:last-child { border-bottom:0; }
     .note:hover { border-bottom-color:var(--attn); }
@@ -245,8 +305,21 @@ export function renderDashboard(report, analysis, labels = {}) {
     .note-evidence { color:var(--muted); }
     .note-action { color:var(--muted); opacity:.7; margin-top:7px; padding-left:15px; border-left:1px solid var(--line); transition:opacity 400ms var(--ease); }
     .note:hover .note-action { opacity:1; }
-    .note-sev { text-align:right; }
+    /* The severity column also carries the estimated saving, which is what the
+       list is ranked by: the figure in ink above the severity word. */
+    .note-meter { text-align:right; }
+    .note-savings { color:var(--ink); margin-bottom:5px; }
     .note-sev.high { color:var(--ink); }
+
+    /* What changed: the signal row again, with direction carried by a sign and a
+       step of ink. The page has one hue and it is reserved for interaction, so a
+       rise and a fall must be legible with no colour at all. */
+    .change { display:grid; grid-template-columns:64px minmax(0,1fr) 92px; align-items:baseline; gap:clamp(10px,1.6vw,20px); border-bottom:1px solid var(--line); padding:clamp(12px,1.4vw,17px) 0; }
+    .change:last-child { border-bottom:0; }
+    .change-name { color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    /* A fall is the same ink, dimmed; a rise is at full strength. */
+    .change-delta { text-align:right; color:var(--ink); opacity:.55; }
+    .change-delta.up { opacity:1; }
 
     .colophon { display:grid; gap:14px; }
     .colophon .prose { max-width:68ch; color:var(--muted); opacity:.72; }
@@ -259,7 +332,9 @@ export function renderDashboard(report, analysis, labels = {}) {
       /* Drop the decorative columns rather than crushing them. */
       .thead .th-mix, .thead .th-kind, .row .bar-cell, .row .row-kind { display:none; }
       .note { grid-template-columns:26px minmax(0,1fr); }
-      .note-sev, .axis .axis-unit { display:none; }
+      /* The delta is the whole row here, so unlike .note-meter it stays. */
+      .change { grid-template-columns:56px minmax(0,1fr) 78px; }
+      .note-meter, .axis .axis-unit { display:none; }
       .section-head { display:block; }
       .switcher { margin-top:14px; }
     }
@@ -299,11 +374,19 @@ export function renderDashboard(report, analysis, labels = {}) {
       <ul class="legend" id="legend" aria-label="Token classes"></ul>
     </section>
 
-    <section class="readings" aria-label="Rates and shares">
+    <section class="readings" aria-label="Rates and savings">
       <div><p class="micro">token volume</p><p class="serif reading" id="tokens">&mdash;</p><p class="micro">input + cache + output</p></div>
-      <div><p class="micro">cache-read share</p><p class="serif reading" id="cache">&mdash;</p><p class="micro" id="cache-note">of prompt tokens</p></div>
-      <div><p class="micro">output-cost share</p><p class="serif reading" id="output">&mdash;</p><p class="micro" id="output-note">of estimated spend</p></div>
+      <div><p class="micro">run rate</p><p class="serif reading" id="run-rate">&mdash;</p><p class="micro" id="run-rate-note">per active day</p></div>
+      <div><p class="micro">identified savings</p><p class="serif reading" id="savings">&mdash;</p><p class="micro" id="savings-note">upper bound across ranked findings</p></div>
       <div><p class="micro">cost per turn</p><p class="serif reading" id="per-turn">&mdash;</p><p class="micro" id="per-turn-note">median billed turn</p></div>
+    </section>
+
+    <section id="changed-section" aria-label="Where spend moved against the previous window">
+      <div class="section-head">
+        <h2 class="micro">what changed / where the money moved, not why</h2>
+        <p class="micro" id="changed-window"></p>
+      </div>
+      <div id="changed" style="margin-top:clamp(18px,2.2vw,26px)"></div>
     </section>
 
     <section aria-label="Cost breakdown">
@@ -328,7 +411,7 @@ export function renderDashboard(report, analysis, labels = {}) {
     </section>
 
     <section aria-label="Where to investigate">
-      <div class="section-head"><h2 class="micro">where to investigate</h2><p class="micro">evidence, not causation</p></div>
+      <div class="section-head"><h2 class="micro">where to investigate / ranked by estimated savings</h2><p class="micro">upper bounds, not causation</p></div>
       <div id="recommendations" style="margin-top:clamp(18px,2.2vw,26px)"></div>
     </section>
 
@@ -360,24 +443,22 @@ export function renderDashboard(report, analysis, labels = {}) {
     // Bar segments in dollars, or nothing when the row is unpriced and the
     // caller should draw its fallback instead.
     const costSplit = row => COST_CLASSES.map(cls => [cls.color,Math.max(0,(row.usdByClass || {})[cls.key] || 0)]);
-    // The output threshold is the one hotspotAnalysis applies in src/report.mjs,
-    // so a reading this page leaves unmarked is one hotspots stays quiet about.
-    // A bare percentage is unjudgeable without it.
-    // The cache figure is a token share, and hotspots decides cache health in
-    // dollars instead — writes cost 1.25x or 2x the input rate and reads a tenth
-    // of it — so this line says whether the share is typical and leaves the
-    // verdict to the recommendation below rather than contradicting it.
-    const CACHE_TYPICAL = 0.8;
-    const OUTPUT_NOTABLE = 0.15;
     const dollars = new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2});
     const cents = new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:4});
+    const whole = new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0});
     const integer = new Intl.NumberFormat('en-US',{maximumFractionDigits:0});
     const percent = value => value == null ? 'n/a' : (value * 100).toFixed(1) + '%';
     // Sub-cent turn costs are common; showing them as $0.00 would read as free.
     const money = value => value > 0 && value < 0.1 ? cents.format(value) : dollars.format(value);
-    // $/call at 3 decimals under a dollar, 2 above: same split as the CLI, so
-    // the two surfaces never disagree on what a tool costs per use.
-    const perCallMoney = value => '$' + value.toFixed(value < 1 ? 3 : 2);
+    // A projection is stated at the precision it can support: whole dollars once
+    // it is real money. Cents on an extrapolation claim an accuracy it lacks.
+    const pace = value => value >= 100 ? whole.format(value) : money(value);
+    // Per-unit money — $/call and $/turn — at 3 decimals under a dollar and 2
+    // above: the same split the CLI's formatFineUsd uses, so the two surfaces
+    // never disagree on what a call or a turn costs. Deliberately not money(),
+    // whose four decimals are there to keep a sub-cent figure from reading as
+    // free and turn a per-turn cost into $0.0902, which reads as noise.
+    const fineMoney = value => '$' + value.toFixed(value < 1 ? 3 : 2);
     const tokenLabel = value => value >= 1e9 ? (value / 1e9).toFixed(2) + 'B' : value >= 1e6 ? (value / 1e6).toFixed(1) + 'M' : value >= 1e4 ? (value / 1e3).toFixed(0) + 'K' : integer.format(value);
     const classSum = usage => CLASSES.reduce((sum,item) => sum + (usage[item.key] || 0), 0);
     const count = (value,noun) => integer.format(value) + ' ' + noun + (value === 1 ? '' : 's');
@@ -421,30 +502,35 @@ export function renderDashboard(report, analysis, labels = {}) {
     if (DATA.diagnostics.unpricedTokens) headline.push('partial, ' + tokenLabel(DATA.diagnostics.unpricedTokens) + ' tokens unpriced');
     document.getElementById('requests').textContent = headline.join(' / ');
     document.getElementById('tokens').textContent = tokenLabel(DATA.total.usage.total);
-    document.getElementById('cache').textContent = percent(DATA.insights.cacheReadShare);
-    document.getElementById('output').textContent = percent(DATA.insights.outputCostShare);
+    // Spend per day is what a total means. The same figure is unremarkable over
+    // a quarter and worth stopping for over a week, and only the rate says
+    // which. The month beside it is this same workload extended at that pace —
+    // never a forecast of the next one, and never a bill. Legacy and tag-shaped
+    // payloads carry no rate, and read as a dash rather than an invented one.
+    const runRate = DATA.insights.runRate;
+    document.getElementById('run-rate').textContent = runRate ? money(runRate.usdPerDay) : '—';
+    document.getElementById('run-rate-note').textContent = runRate
+      ? 'per active day / ~' + pace(runRate.projectedMonthlyUsd) + ' per 30d at this pace'
+      : 'no dated records in this window';
+    // What the ranked findings below are worth if every one of them is acted on.
+    // An upper bound across the findings that could be quantified, never a total
+    // of the window: a window where nothing crossed a threshold says so.
+    const savings = DATA.savings;
+    const quantified = savings && savings.totalUsd > 0;
+    document.getElementById('savings').textContent = quantified ? money(savings.totalUsd) : '—';
+    document.getElementById('savings-note').textContent = quantified
+      ? 'upper bound across ' + count(savings.quantifiedFindings,'ranked finding')
+      : 'nothing quantified in this window';
     // The median is the turn this window actually looks like; a handful of huge
     // turns drags the mean well above it, so both are shown and the mean is the
     // one in the footnote. Older tag-shaped data has no distribution, so the
     // mean is recomputed rather than leaving the reading blank.
     const perTurn = DATA.insights.perTurnUsd;
-    document.getElementById('per-turn').textContent = perTurn ? money(perTurn.p50)
-      : DATA.total.requests ? money(DATA.total.usd / DATA.total.requests) : 'n/a';
+    document.getElementById('per-turn').textContent = perTurn ? fineMoney(perTurn.p50)
+      : DATA.total.requests ? fineMoney(DATA.total.usd / DATA.total.requests) : 'n/a';
     document.getElementById('per-turn-note').textContent = perTurn
-      ? 'median billed turn / mean ' + money(perTurn.mean) + ' / p90 ' + money(perTurn.p90)
+      ? 'median billed turn / mean ' + fineMoney(perTurn.mean) + ' / p90 ' + fineMoney(perTurn.p90)
       : 'mean billed turn';
-    // Say which side of the threshold each share falls on, so the number can be
-    // judged without knowing the rate card.
-    const mark = value => Math.round(value * 100) + '%';
-    const cacheNote = DATA.insights.cacheReadShare == null ? 'of prompt tokens'
-      : DATA.insights.cacheReadShare >= CACHE_TYPICAL ? 'of prompt tokens / typical above ' + mark(CACHE_TYPICAL)
-      : 'of prompt tokens / under ' + mark(CACHE_TYPICAL);
-    const outputNote = DATA.insights.outputCostShare == null ? 'of estimated spend'
-      : DATA.insights.outputCostShare >= OUTPUT_NOTABLE ? 'of estimated spend / flagged over ' + mark(OUTPUT_NOTABLE)
-      : 'of estimated spend / under ' + mark(OUTPUT_NOTABLE);
-    document.getElementById('cache-note').textContent = cacheNote;
-    document.getElementById('output-note').textContent = outputNote;
-
     // The legend names what the bars are actually made of, in the same unit as
     // the bars: dollars. Token counts are a different story and live in the row
     // detail, where they are labelled as tokens. The four entries are the four
@@ -518,6 +604,41 @@ export function renderDashboard(report, analysis, labels = {}) {
     document.getElementById('first-day').textContent = days[0]?.day || '';
     document.getElementById('last-day').textContent = days.at(-1)?.day || '';
 
+    // What moved between the two windows the trend compared. The headline says
+    // spend rose; this says where it rose, which is the question that follows it.
+    // Descriptive only — the heading says "not why" — and monochrome: direction
+    // is a leading sign plus a step of ink, never a hue.
+    const changed = DATA.changed;
+    const changedRows = changed
+      ? [...changed.byModel.map(row => ['model',row]), ...changed.byProject.map(row => ['project',row])]
+      : [];
+    const changedTarget = document.getElementById('changed');
+    // U+2212, not a hyphen: it is the same width as the plus, so a column of
+    // signed figures stays aligned in the tabular-nums voice around it.
+    const signedMoney = value => (value < 0 ? '−' : '+') + money(Math.abs(value));
+    if (changed) {
+      document.getElementById('changed-window').textContent = 'last ' + count(changed.days,'day') + ' vs previous ' + changed.days;
+      // The exact windows, for a reader who cannot see the layout.
+      if (changed.current.start && changed.previous.start) {
+        document.getElementById('changed-section').setAttribute('aria-label','Where spend moved: ' + changed.current.start + ' to ' + changed.current.end + ' against ' + changed.previous.start + ' to ' + changed.previous.end);
+      }
+    }
+    for (const [kind,row] of changedRows) {
+      const line = document.createElement('div'); line.className = 'change';
+      const label = document.createElement('p'); label.className = 'micro'; label.textContent = kind;
+      const name = document.createElement('p'); name.className = 'change-name'; name.textContent = row.name;
+      const delta = document.createElement('p'); delta.className = 'change-delta' + (row.deltaUsd < 0 ? '' : ' up');
+      delta.textContent = signedMoney(row.deltaUsd);
+      line.append(label,name,delta); changedTarget.append(line);
+    }
+    if (!changedRows.length) {
+      const empty = document.createElement('p'); empty.className = 'empty';
+      // Two different silences: no second window to compare against at all, and
+      // two windows where nothing moved. Neither is a reason to hide the section.
+      empty.textContent = changed ? 'no model or project moved between these two windows' : 'not enough history to compare two windows';
+      changedTarget.append(empty);
+    }
+
     const recs = document.getElementById('recommendations');
     DATA.recommendations.forEach((rec,index) => {
       const note = document.createElement('div'); note.className = 'note';
@@ -527,8 +648,14 @@ export function renderDashboard(report, analysis, labels = {}) {
       const evidence = document.createElement('p'); evidence.className = 'note-evidence'; evidence.textContent = rec.evidence;
       const action = document.createElement('p'); action.className = 'note-action'; action.textContent = rec.action;
       body.append(kind,evidence,action);
+      // The saving is what the list is ordered by, so it sits above the severity
+      // word in the same column and the same micro voice. A finding with no
+      // defensible counterfactual prints the severity alone rather than a zero.
+      const meter = document.createElement('div'); meter.className = 'note-meter';
+      if (rec.estimatedSavingsUsd != null) { const savings = document.createElement('p'); savings.className = 'micro note-savings'; savings.textContent = money(rec.estimatedSavingsUsd); meter.append(savings); }
       const severity = document.createElement('p'); severity.className = 'micro note-sev ' + rec.severity; severity.textContent = rec.severity;
-      note.append(number,body,severity); recs.append(note);
+      meter.append(severity);
+      note.append(number,body,meter); recs.append(note);
     });
     if (!DATA.recommendations.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = 'nothing crossed a hotspot threshold in this window'; recs.append(empty); }
 
@@ -540,7 +667,7 @@ export function renderDashboard(report, analysis, labels = {}) {
     const detailText = {
       models:item => count(item.requests,'billed turn'),
       tools:item => {
-        const perCall = item.usdPerCall == null ? 'n/a' : '≈' + perCallMoney(item.usdPerCall) + '/call';
+        const perCall = item.usdPerCall == null ? 'n/a' : '≈' + fineMoney(item.usdPerCall) + '/call';
         const solo = item.soloShare == null ? 'solo n/a' : 'solo ' + Math.round(item.soloShare * 100) + '% of attributed cost';
         return count(item.calls,'call') + ' / ' + count(item.followOnRequests,'following billed turn') + ' / attribution is correlation / ' + perCall + ' / ' + solo;
       },
@@ -622,9 +749,9 @@ export function isLoopbackHost(host, port) {
   return name === LOOPBACK_HOST || name === "localhost" || name === "[::1]";
 }
 
-export async function startDashboard(report, analysis, { port = 7474, labels = {} } = {}) {
+export async function startDashboard(report, analysis, { port = 7474, labels = {}, trend = null } = {}) {
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("--port must be an integer from 0 to 65535.");
-  const page = renderDashboard(report, analysis, labels);
+  const page = renderDashboard(report, analysis, labels, trend);
   const server = createServer((request, response) => {
     if (!isLoopbackHost(request.headers.host, server.address()?.port ?? port)) {
       response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });

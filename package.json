@@ -1,6 +1,6 @@
 {
   "name": "agent-finops",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "description": "Private, local-only token and cost reporting for coding agents",
   "type": "module",

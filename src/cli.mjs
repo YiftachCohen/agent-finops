@@ -340,8 +340,17 @@ async function main() {
       // Local project labels are the user's own names for anonymous ids. They
       // carry no path, so they can name a row on the page instead of a
       // fingerprint nobody can place.
-      const analysis = hotspotAnalysis(dashboardReport, hotspotExtras(records, sinceMs));
-      const running = await startDashboard(dashboardReport, analysis, { port: args.port, labels: loadLabels() });
+      const extras = hotspotExtras(records, sinceMs);
+      const analysis = hotspotAnalysis(dashboardReport, extras);
+      // The page's "what changed" section reads the same trend the hotspot rules
+      // do, so the two cannot describe different windows. That trend is the
+      // fixed 7-day pair, deliberately not derived from `--since`: a comparison
+      // whose length changed with the view would mean something different every
+      // time it was opened, and only the two most recent complete weeks answer
+      // "what changed" regardless of how much history is on screen. The section
+      // states the windows it used. `extras.trend` is absent when the index
+      // holds too little history, and the section says so rather than vanishing.
+      const running = await startDashboard(dashboardReport, analysis, { port: args.port, labels: loadLabels(), trend: extras.trend || null });
       console.log(`Dashboard running at ${running.url}`);
       console.log("Loopback only. Press Ctrl-C to stop.");
       await new Promise((resolve) => running.server.once("close", resolve));
@@ -349,7 +358,20 @@ async function main() {
     }
     if (args.command === "report") {
       const report = reportWith();
-      console.log(args.json ? JSON.stringify(report, null, 2) : humanReport(report));
+      if (args.json) {
+        // `--json` is the artifact people share, and a label is the user's own
+        // name for a workspace: neither it nor the trend enters the shared shape.
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+      // Best-effort context, exactly as it is for the hotspot rules: a trend
+      // needs history the index may not hold, and no report may fail because one
+      // could not be built. Computed only for the terminal view, since it costs
+      // two more passes over the corpus and `--json` never reads it.
+      let trend = null;
+      try { trend = analyzeTrend(records, { days: 7 }); } catch { /* not enough history */ }
+      // Local project labels name the anonymous ids in the terminal view only.
+      console.log(humanReport(report, loadLabels(), trend));
       return;
     }
     if (args.command === "hotspots") {
@@ -360,7 +382,7 @@ async function main() {
     }
     if (args.command === "sessions") {
       const sessionReport = buildReport(records, { sinceMs, untilMs, sessionLimit: listLimit(args.limit) });
-      console.log(args.json ? JSON.stringify(sessionReport.topSessions, null, 2) : humanSessions(sessionReport.topSessions));
+      console.log(args.json ? JSON.stringify(sessionReport.topSessions, null, 2) : humanSessions(sessionReport.topSessions, loadLabels()));
       return;
     }
     if (args.command === "session") {
@@ -368,7 +390,7 @@ async function main() {
       if (!id) throw new Error("session requires a session ID printed by `agent-finops sessions`.");
       const sessionReport = buildReport(records.filter((record) => record.source === id), { sinceMs, untilMs, toolLimit: listLimit(args.limit) });
       if (!sessionReport.scope.recordsAfterDateFilter) throw new Error(`No usage records found for session ${id} in this period.`);
-      console.log(args.json ? JSON.stringify(sessionReport, null, 2) : humanReport(sessionReport));
+      console.log(args.json ? JSON.stringify(sessionReport, null, 2) : humanReport(sessionReport, loadLabels()));
       return;
     }
     if (args.command === "compare-sessions") {
@@ -403,8 +425,9 @@ async function main() {
       const projectReport = buildReport(records.filter((record) => record.project === id), { sinceMs, untilMs, toolLimit: listLimit(args.limit) });
       if (!projectReport.scope.recordsAfterDateFilter) throw new Error(`No usage records found for project ${id} in this period.`);
       // The label is a local name for the id, so it heads the report rather than
-      // entering it: the report body is the artifact people share.
-      console.log(args.json ? JSON.stringify(projectReport, null, 2) : `Project: ${displayProject(id, loadLabels())}\n${humanReport(projectReport)}`);
+      // entering it: the JSON body is the artifact people share.
+      const projectLabels = loadLabels();
+      console.log(args.json ? JSON.stringify(projectReport, null, 2) : `Project: ${displayProject(id, projectLabels)}\n${humanReport(projectReport, projectLabels)}`);
       return;
     }
     if (args.command === "trend") {

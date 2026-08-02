@@ -1,4 +1,5 @@
-import { canonicalModelId, cheaperSiblingModel, costFor, priceUsage } from "./rates.mjs";
+import { displayProject } from "./labels.mjs";
+import { CACHE_READ_MULTIPLIER, CACHE_WRITE_1H_MULTIPLIER, CACHE_WRITE_5M_MULTIPLIER, canonicalModelId, cheaperSiblingModel, costFor, priceUsage } from "./rates.mjs";
 
 const EMPTY_USAGE = () => ({ input: 0, cacheCreate: 0, cacheCreate1h: 0, cacheCreate5m: 0, cacheRead: 0, output: 0, total: 0 });
 
@@ -75,10 +76,20 @@ function toolBucket() {
   return { ...bucket(), calls: 0, followOnRequests: 0, soloUsd: 0, soloFollowOnRequests: 0 };
 }
 
+// A record whose timestamp cannot be parsed still counts, but it cannot be
+// placed on a calendar day: it is bucketed here and excluded from every reading
+// that is per-day, rather than being dropped or dated by guesswork.
+const UNDATED_BUCKET = "<unknown-date>";
+
 function datedBucketKey(timestamp) {
   const time = Date.parse(timestamp || "");
-  return Number.isFinite(time) ? new Date(time).toISOString().slice(0, 10) : "<unknown-date>";
+  return Number.isFinite(time) ? new Date(time).toISOString().slice(0, 10) : UNDATED_BUCKET;
 }
+
+// A month at the current pace. Thirty days, not a calendar month, so the figure
+// is a fixed multiple of a daily rate rather than a number that changes meaning
+// in February.
+const PROJECTION_DAYS = 30;
 
 /**
  * Nearest-rank percentile over an ascending list: the smallest sample at or
@@ -98,6 +109,43 @@ function turnDistribution(turnUsd) {
     mean: sorted.reduce((sum, value) => sum + value, 0) / sorted.length,
     p50: percentileOf(sorted, 0.5),
     p90: percentileOf(sorted, 0.9),
+  };
+}
+
+/**
+ * What this window costs per day, and how the worst day compares with the usual
+ * one. A total with no time context is unreadable: $5,000 is a rounding error
+ * over a year and an emergency over a week.
+ *
+ * `days` counts the distinct UTC day buckets that hold records, not the calendar
+ * span of the window. A 30-day window worked on 12 days is a 12-day rate:
+ * dividing by the span would average in days nobody was running the agent and
+ * understate the pace of the days that were worked, which is the pace a
+ * projection is made of. The projection says so — it is what 30 days like these
+ * would cost on this same workload, never a forecast of the next 30.
+ *
+ * `usdPerDay` spreads the window's whole estimate — including any record too
+ * undated to place on a day — over the days it could place, so the rate and the
+ * headline cost stay the same money. Null when nothing is dated at all.
+ */
+function runRateOf(byDay, totalUsd) {
+  const dated = Object.entries(byDay).filter(([day]) => day !== UNDATED_BUCKET).sort(([a], [b]) => a.localeCompare(b));
+  if (!dated.length) return null;
+  const usdPerDay = totalUsd / dated.length;
+  const median = percentileOf(dated.map(([, value]) => value.usd).sort((a, b) => a - b), 0.5);
+  const peak = dated.reduce((worst, entry) => (entry[1].usd > worst[1].usd ? entry : worst));
+  return {
+    days: dated.length,
+    firstDay: dated[0][0],
+    lastDay: dated[dated.length - 1][0],
+    usdPerDay,
+    projectedMonthlyUsd: usdPerDay * PROJECTION_DAYS,
+    // The most expensive day, against the day this window usually looks like.
+    // A ratio is how an anomalous burn is spotted; the median is the baseline
+    // because one runaway day would drag a mean up toward itself and hide.
+    // Null ratio when the median day cost nothing — a multiple of zero is not a
+    // reading — rather than an infinity.
+    peakDay: { day: peak[0], usd: peak[1].usd, ratioToMedian: median > 0 ? peak[1].usd / median : null },
   };
 }
 
@@ -243,6 +291,9 @@ export function buildReport(rawRecords, { sinceMs = null, untilMs = null, sessio
       // shape: a handful of huge turns pulls it well above the turn most of the
       // window actually looks like, which is what p50 and p90 are for.
       perTurnUsd: turnDistribution(pricedTurns),
+      // Spend per active day, the month that pace comes to, and the peak day
+      // against the median one. Null when no record in the window can be dated.
+      runRate: runRateOf(byDay, all.usd),
       unpricedTokens: all.unpricedTokens,
     },
   };
@@ -253,15 +304,21 @@ export function buildReport(rawRecords, { sinceMs = null, untilMs = null, sessio
 const MODEL_CONCENTRATION_SHARE = 0.5;
 const OUTPUT_COST_SHARE = 0.15;
 const CACHE_READ_HEALTHY_SHARE = 0.8;
-// A cache read is billed at a tenth of the input rate, so the same tokens read
-// uncached would have cost ten times what they did; the saving is the other
-// nine tenths of that counterfactual bill.
-const CACHE_READ_SAVINGS_MULTIPLIER = 9;
-// Below this on either side the ordering is real but the money is not, and a
-// recommendation about a few cents is noise.
-const CACHE_ECONOMICS_FLOOR_USD = 1;
+// The TTL question is only worth raising once the 1-hour premium is real money
+// and is most of what the window paid to fill its cache. Below either bound the
+// split is an ordering, not a lever.
+const CACHE_TTL_1H_USD = 10;
+const CACHE_TTL_1H_SHARE = 0.5;
+// One number for "cache writes are a large share of this bill": it raises the
+// TTL finding from a tradeoff to understand to one worth acting on, and it is
+// what makes the fallback cache reading worth printing at all.
+const CACHE_WRITE_HEAVY_SHARE = 0.35;
 const SESSION_OUTLIER_USD = 10;
 const CONTEXT_BLOAT_TOKENS = 150_000;
+// Deliberately the same number as the trigger: the context size that makes a
+// session a finding is also the ceiling its counterfactual is measured against,
+// so the rule cannot claim a saving for shrinking a context it never flagged.
+const CONTEXT_TARGET_TOKENS = CONTEXT_BLOAT_TOKENS;
 const CONTEXT_BLOAT_USD = 5;
 const CONTEXT_BLOAT_HIGH_SHARE = 0.2;
 const MCP_FOLLOW_ON_USD = 10;
@@ -269,6 +326,37 @@ const MCP_FOLLOW_ON_HIGH_SHARE = 0.2;
 const BASH_FILTER_USD = 25;
 const ACCELERATION_PCT = 0.5;
 const ACCELERATION_USD = 10;
+
+// What the same cache-write tokens would have cost at the 5-minute rate instead
+// of the 1-hour one, as a share of what they did cost: 1 - 1.25/2 = 0.375.
+const CACHE_TTL_SAVINGS_RATIO = 1 - CACHE_WRITE_5M_MULTIPLIER / CACHE_WRITE_1H_MULTIPLIER;
+// The 1-hour write's premium over the 5-minute one, stated the way the tradeoff
+// is felt: 2 / 1.25 = 1.6, so it is 60% more per write.
+const CACHE_TTL_PREMIUM_PCT = Math.round((CACHE_WRITE_1H_MULTIPLIER / CACHE_WRITE_5M_MULTIPLIER - 1) * 100);
+
+// Ranking order for a tie on savings. Two findings worth the same estimated
+// dollars are separated by how confidently the rule fired, and only then by the
+// order the rules run in.
+const SEVERITY_RANK = { __proto__: null, high: 0, medium: 1, info: 2 };
+
+/**
+ * Rank recommendations by what acting on them is estimated to be worth: most
+ * dollars first, unquantified findings last, ties broken by severity and then
+ * by the order the rules produced them. `null` sorts last rather than as zero —
+ * "no defensible counterfactual" is not "worth nothing".
+ */
+function rankRecommendations(recommendations) {
+  return recommendations
+    .map((item, order) => ({ item, order }))
+    .sort((a, b) => {
+      const left = a.item.estimatedSavingsUsd ?? null;
+      const right = b.item.estimatedSavingsUsd ?? null;
+      if ((left === null) !== (right === null)) return left === null ? 1 : -1;
+      if (left !== null && right !== null && left !== right) return right - left;
+      return (SEVERITY_RANK[a.item.severity] ?? 99) - (SEVERITY_RANK[b.item.severity] ?? 99) || a.order - b.order;
+    })
+    .map((entry) => entry.item);
+}
 
 /**
  * Re-price a model's own tokens at its cheaper sibling's rate. The counterfactual
@@ -287,42 +375,64 @@ function modelWhatIf(model, aggregate) {
   return savedUsd > 0 ? { model: sibling, savedUsd } : null;
 }
 
+/** Cache writes as a share of the window's estimated spend, or null unpriced. */
+function cacheWriteShare(report) {
+  const byClass = report.total?.usdByClass;
+  const totalUsd = report.total?.usd || 0;
+  if (!byClass || !totalUsd) return null;
+  return (byClass.cacheWrite || 0) / totalUsd;
+}
+
 /**
- * The cache verdict in dollars rather than in token share. Tokens rank the two
- * classes wrongly: writes cost 1.25x or 2x the input rate and reads a tenth of
- * it, so a window can read overwhelmingly from cache and still be losing money
- * on it. Null when nothing is priced, or when both sides are too small to call.
+ * The one cache question whose answer actually varies. Comparing write cost with
+ * what reads would have cost uncached does not: a read is billed at a tenth of
+ * the input rate and an agent re-reads its context every turn, so that
+ * counterfactual is enormous and favourable in every window, which makes it
+ * decoration rather than a finding.
+ *
+ * The TTL split is the real decision surface. A 1-hour write costs 2x the input
+ * rate and a 5-minute write 1.25x, so the same tokens carry a 60% premium — but
+ * a 5-minute entry that expires between turns is re-written whole, and one
+ * re-write costs more than the premium saved. This states both sides and the
+ * dollars on the table; it does not tell anyone which way to go.
  */
-function cacheEconomics(report) {
+function cacheTtl(report) {
   const byClass = report.total?.usdByClass;
   if (!byClass) return null;
   const writeUsd = byClass.cacheWrite || 0;
-  const savedUsd = (byClass.cacheRead || 0) * CACHE_READ_SAVINGS_MULTIPLIER;
-  if (writeUsd <= 0 && savedUsd <= 0) return null;
-  if (writeUsd < savedUsd) return {
-    kind: "cache",
-    severity: "info",
-    evidence: `Cache writes cost ${formatUsd(writeUsd)} and saved ≈ ${formatUsd(savedUsd)} against uncached reads, which would have been billed at the full input rate.`,
-    action: "Caching is net positive here; prioritize model concentration and tool-output volume before changing TTL policy.",
-  };
-  if (writeUsd < CACHE_ECONOMICS_FLOOR_USD || savedUsd < CACHE_ECONOMICS_FLOOR_USD) return null;
-  const oneHour = report.insights?.cacheWrite1hShare;
-  const ttl = oneHour != null && oneHour >= 0.5 ? ` 1-hour writes are ${(oneHour * 100).toFixed(1)}% of that write cost, at twice the input rate.` : "";
+  const oneHourUsd = byClass.cacheWrite1h || 0;
+  if (oneHourUsd < CACHE_TTL_1H_USD || writeUsd <= 0) return null;
+  const oneHourShare = oneHourUsd / writeUsd;
+  if (oneHourShare < CACHE_TTL_1H_SHARE) return null;
+  const spendShare = cacheWriteShare(report);
+  const savedUsd = oneHourUsd * CACHE_TTL_SAVINGS_RATIO;
+  const shareOfSpend = spendShare == null ? "" : `${(spendShare * 100).toFixed(1)}% of estimated spend (${formatUsd(writeUsd)})`;
   return {
-    kind: "cache",
-    severity: "medium",
-    evidence: `Cache writes cost ${formatUsd(writeUsd)} against ≈ ${formatUsd(savedUsd)} saved on reads: this window pays more to fill the cache than its reads recover.${ttl}`,
-    action: "Inspect session restarts, directory/worktree churn, and MCP catalog size; each one refills the cache before enough turns read it back.",
+    kind: "cache-ttl",
+    severity: spendShare != null && spendShare > CACHE_WRITE_HEAVY_SHARE ? "medium" : "info",
+    estimatedSavingsUsd: savedUsd,
+    evidence: `Cache writes are ${shareOfSpend || formatUsd(writeUsd)}, of which ${(oneHourShare * 100).toFixed(1)}% (${formatUsd(oneHourUsd)}) was bought at the 1-hour rate (2x input) rather than the 5-minute rate (1.25x). The same tokens written at the 5-minute rate would be ${formatUsd(savedUsd)} less — an upper bound that assumes every one of those entries would still have been read before it expired.`,
+    action: `This is a tradeoff, not a defect: a 1-hour TTL costs ${CACHE_TTL_PREMIUM_PCT}% more per write, but a 5-minute entry that expires between turns is re-written in full, and one re-write costs more than the premium it saved. The lever is session cadence — long gaps between turns favour the 1-hour write, continuous work favours the 5-minute one — so measure a tagged window of each rather than flipping a flag.`,
   };
 }
 
-/** The token-share reading, kept as the fallback for a window with no dollars. */
-function cacheShare(report) {
+/**
+ * The token-share reading, kept for the windows the TTL rule cannot speak to: no
+ * per-class dollars at all, or a cache bill dominated by 5-minute writes. It is
+ * only worth printing when cache writes are a large share of the spend, or when
+ * there are no dollars to weigh them against and the token share is all there is.
+ */
+function cacheEfficiency(report) {
   if (report.insights?.cacheReadShare == null) return null;
+  const spendShare = cacheWriteShare(report);
+  if (spendShare != null && spendShare < CACHE_WRITE_HEAVY_SHARE) return null;
   const efficient = report.insights.cacheReadShare >= CACHE_READ_HEALTHY_SHARE;
   return {
-    kind: "cache",
+    kind: "cache-efficiency",
     severity: efficient ? "info" : "medium",
+    // No savings figure: a read share is not a counterfactual, and the honest
+    // upper bound on "read from cache more" is a number this rule cannot derive.
+    estimatedSavingsUsd: null,
     evidence: `Cache reads are ${(report.insights.cacheReadShare * 100).toFixed(1)}% of prompt tokens.`,
     action: efficient
       ? "Caching is already net positive on tokens; prioritize model concentration and tool-output volume before changing TTL policy."
@@ -336,32 +446,82 @@ function cacheShare(report) {
  * offender — and one row is the point: repeating the same advice per session
  * buries which one to actually look at.
  */
-function contextBloat(report) {
-  const worst = (report.topSessions || []).find((session) => (session.avgPromptTokens || 0) >= CONTEXT_BLOAT_TOKENS && (session.usd || 0) >= CONTEXT_BLOAT_USD);
+function bloatedSession(report) {
+  return (report.topSessions || []).find((session) => (session.avgPromptTokens || 0) >= CONTEXT_BLOAT_TOKENS && (session.usd || 0) >= CONTEXT_BLOAT_USD) || null;
+}
+
+/**
+ * What capping this session's average prompt at `CONTEXT_TARGET_TOKENS` would
+ * have saved. Only the cache-read line scales: it is the context re-billed on
+ * every turn, so a prompt held to a fraction of its size re-bills that same
+ * fraction. Null on a bucket with no per-class dollars — an older tag snapshot —
+ * because guessing which part of its estimate was cache reads would invent the
+ * number the finding is ranked by.
+ */
+function contextBloatSavings(session) {
+  const cacheReadUsd = session.usdByClass?.cacheRead;
+  const average = session.avgPromptTokens || 0;
+  if (cacheReadUsd == null || average <= 0) return null;
+  return Math.max(0, cacheReadUsd * (1 - CONTEXT_TARGET_TOKENS / average));
+}
+
+function contextBloat(report, worst) {
   if (!worst) return null;
   const share = report.total?.usd ? worst.usd / report.total.usd : 0;
+  const savedUsd = contextBloatSavings(worst);
+  const counterfactual = savedUsd == null
+    ? ""
+    : ` Holding the average prompt to ${Math.round(CONTEXT_TARGET_TOKENS / 1000)}K would re-bill its cache reads in proportion, ≈${formatUsd(savedUsd)} less — an upper bound that assumes the same work fits in the smaller context.`;
   return {
     kind: "context-bloat",
     severity: share >= CONTEXT_BLOAT_HIGH_SHARE ? "high" : "medium",
-    evidence: `Session ${worst.id} averaged ${Math.round(worst.avgPromptTokens / 1000)}K prompt tokens per turn across ${worst.requests || 0} turn(s) (≈${formatUsd(worst.usd)}).`,
+    estimatedSavingsUsd: savedUsd,
+    evidence: `Session ${worst.id} averaged ${Math.round(worst.avgPromptTokens / 1000)}K prompt tokens per turn across ${worst.requests || 0} turn(s) (≈${formatUsd(worst.usd)}).${counterfactual}`,
     action: "Start fresh sessions at task boundaries, or compact earlier: a long transcript re-bills the whole context on every turn as cache reads.",
   };
+}
+
+/** The model that paid for most of this window; `byModel` is sorted by cost. */
+function dominantModel(report) {
+  return Object.keys(report.byModel || {})[0] || null;
+}
+
+/**
+ * What the tokens the local filter removed would have cost. They would have
+ * entered the context as a cache write, so they are priced as one at the
+ * dominant model's rate — through `priceUsage`, so the TTL multipliers are the
+ * ones the real estimate uses, and at the 5-minute rate because unclassified
+ * write tokens are always charged at the conservative floor. Null when the
+ * ledger has removed nothing, or when the dominant model has no local rate.
+ */
+function filterSavings(report, filterStats) {
+  if (!(filterStats?.savedChars > 0)) return null;
+  const tokens = filterStats.estimatedTokensSaved || 0;
+  if (tokens <= 0) return null;
+  const model = dominantModel(report);
+  const priced = model ? priceUsage({ cacheCreate: tokens }, model) : null;
+  return priced ? priced.usd : null;
 }
 
 /**
  * Bash follow-on cost, pointed at this tool's own lever. Measured filter savings
  * are quoted when the local ledger has any; they are what the filter actually
- * removed, not a projection of what it would remove next.
+ * removed, not a projection of what it would remove next. With no ledger the
+ * finding still fires, unquantified: the cohort cost is the evidence, and the
+ * saving is unknown rather than zero.
  */
 function bashOutputFilter(report, filterStats) {
   const bash = report.topTools?.find((tool) => tool.name === "Bash");
   if (!(bash?.usd >= BASH_FILTER_USD)) return null;
+  const savedUsd = filterSavings(report, filterStats);
+  const priced = savedUsd == null ? "" : ` At ${dominantModel(report)} cache-write rates that is ≈${formatUsd(savedUsd)} of context never bought.`;
   const measured = filterStats?.savedChars > 0
-    ? ` The local output filter has already removed ~${tokenFormat.format(filterStats.estimatedTokensSaved || 0)} input tokens across ${filterStats.events || 0} filtered result(s).`
+    ? ` The local output filter has already removed ~${tokenFormat.format(filterStats.estimatedTokensSaved || 0)} input tokens across ${filterStats.events || 0} filtered result(s).${priced}`
     : "";
   return {
     kind: "bash-output-filter",
     severity: "medium",
+    estimatedSavingsUsd: savedUsd,
     evidence: `Bash carries ${formatUsd(bash.usd)} in equally apportioned follow-on request cost across ${bash.followOnRequests || 0} turn(s) — correlation for prioritization, not proof that the output caused the cost.${measured}`,
     action: "Enable the local PostToolUse output filter with `agent-finops hook-config`, then measure what it removes with `agent-finops filter-report`.",
   };
@@ -386,6 +546,9 @@ function spendAcceleration(trend) {
   return {
     kind: "spend-acceleration",
     severity: "medium",
+    // A rise is a description, not a defect: the workload may simply have grown.
+    // There is no counterfactual to price, so no saving is claimed.
+    estimatedSavingsUsd: null,
     evidence: `Estimated spend rose ${(trend.deltaPct * 100).toFixed(1)}% against the previous ${trend.days}-day window, ${formatUsd(previous?.total?.usd || 0)} → ${formatUsd(current.total.usd)}.${named}`,
     action: "Check whether the workload itself grew before changing configuration; compare tagged, matched task windows before attributing the change to anything.",
   };
@@ -396,6 +559,12 @@ function spendAcceleration(trend) {
  * report cannot hold on its own — the filter ledger and a trend over the same
  * records — and every rule that reads it degrades to silence when it is absent,
  * so a caller that has neither still gets the full set of report-only findings.
+ *
+ * Every finding carries `estimatedSavingsUsd`: the honest upper bound of acting
+ * on it, or null where no counterfactual can be defended. The returned list is
+ * ranked by it, because the question a FinOps tool exists to answer is which of
+ * these is worth doing first. The figures are ceilings on the same workload, not
+ * forecasts, and never a claim about a bill.
  */
 export function hotspotAnalysis(report, extras = {}) {
   const modelRows = Object.entries(report.byModel);
@@ -411,6 +580,7 @@ export function hotspotAnalysis(report, extras = {}) {
       recommendations.push({
         kind: "model-concentration",
         severity: "high",
+        estimatedSavingsUsd: whatIf ? whatIf.savedUsd : null,
         evidence: `${topModel[0]} is ${(share * 100).toFixed(1)}% of estimated spend.${counterfactual}`,
         action: "Run a tagged, comparable task set with a lower-cost model before changing the global default.",
       });
@@ -419,23 +589,41 @@ export function hotspotAnalysis(report, extras = {}) {
   if (report.insights.outputCostShare != null && report.insights.outputCostShare >= OUTPUT_COST_SHARE) recommendations.push({
     kind: "output-cost",
     severity: "medium",
+    // Shorter output is a different answer, not the same one for less; there is
+    // no fixed workload to re-price, so no saving is claimed.
+    estimatedSavingsUsd: null,
     evidence: `Output tokens are ${(report.insights.outputCostShare * 100).toFixed(1)}% of estimated spend.`,
     action: "Constrain verbose plans and repeated explanations; preserve detailed output only for failing diagnostics.",
   });
-  const cache = cacheEconomics(report) || cacheShare(report);
+  const cache = cacheTtl(report) || cacheEfficiency(report);
   if (cache) recommendations.push(cache);
-  if (report.topSessions[0]?.usd >= SESSION_OUTLIER_USD) recommendations.push({
+  // The two session rules are one diagnosis each, so they never name the same
+  // row: context-bloat is the more specific reading and carries a saving, and a
+  // session it already claims is not also reported as a bare outlier. What is
+  // left for session-outlier is the genuinely different case — expensive because
+  // of how many turns it ran, not how much context each one hauled. Sessions are
+  // ordered by cost and context-bloat takes the first qualifying row, so a top
+  // session it declined is one whose per-turn context is under the threshold.
+  const bloated = bloatedSession(report);
+  const topSession = report.topSessions?.[0];
+  if (topSession?.usd >= SESSION_OUTLIER_USD && topSession.id !== bloated?.id) recommendations.push({
     kind: "session-outlier",
     severity: "medium",
-    evidence: `The top anonymous session cost ${formatUsd(report.topSessions[0].usd)}.`,
-    action: "Use session-level tags to compare its workflow against cheaper successful sessions; do not inspect transcript content by default.",
+    // "Run fewer turns" is not a counterfactual anyone can price: the turns are
+    // the work. The finding says where to look, not what it is worth.
+    estimatedSavingsUsd: null,
+    evidence: `The top anonymous session cost ${formatUsd(topSession.usd)} across ${topSession.requests || 0} turn(s), averaging ${tokenFormat.format(topSession.avgPromptTokens || 0)} prompt tokens per turn — under the ${Math.round(CONTEXT_BLOAT_TOKENS / 1000)}K context-bloat threshold, so this session is expensive for how many turns it ran rather than how heavy each one was.`,
+    action: "Use session-level tags to compare its turn count and workflow against cheaper successful sessions; do not inspect transcript content by default.",
   });
-  const bloat = contextBloat(report);
+  const bloat = contextBloat(report, bloated);
   if (bloat) recommendations.push(bloat);
   const topMcp = report.topTools?.find((tool) => tool.name.startsWith("mcp__"));
   if (topMcp?.usd >= MCP_FOLLOW_ON_USD) recommendations.push({
     kind: "mcp-follow-on-cost",
     severity: topMcp.usd / report.total.usd >= MCP_FOLLOW_ON_HIGH_SHARE ? "high" : "medium",
+    // The cohort is correlation, so its dollars are not a saving waiting to be
+    // taken: pricing them as one would present attribution as causation.
+    estimatedSavingsUsd: null,
     evidence: `${topMcp.name} has ${formatUsd(topMcp.usd)} in equally apportioned follow-on request cost across ${topMcp.followOnRequests} turn(s).`,
     action: "Inspect this MCP's schema and result size, then compare a tagged workflow with fewer calls or a narrower response.",
   });
@@ -443,7 +631,14 @@ export function hotspotAnalysis(report, extras = {}) {
   if (bash) recommendations.push(bash);
   const acceleration = spendAcceleration(extras.trend);
   if (acceleration) recommendations.push(acceleration);
-  return { generatedAt: new Date().toISOString(), recommendations };
+  const ranked = rankRecommendations(recommendations);
+  return {
+    generatedAt: new Date().toISOString(),
+    recommendations: ranked,
+    // The headline a caller can lead with. Sums only what was quantified, so it
+    // is a floor on the ranked list's ceiling, never a total of the window.
+    totalEstimatedSavingsUsd: ranked.reduce((sum, item) => sum + (item.estimatedSavingsUsd || 0), 0),
+  };
 }
 
 export function compareSnapshots(leftName, left, rightName, right) {
@@ -466,14 +661,55 @@ function formatUsd(value) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(value);
 }
 
+const usdWhole = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+
+// A projected pace, stated at the precision it can support: whole dollars once
+// it is real money, cents below that. Printing cents on an extrapolation would
+// claim an accuracy the extrapolation does not have.
+function formatPaceUsd(value) {
+  return value >= 100 ? usdWhole.format(value) : formatUsd(value);
+}
+
+// Three decimals under a dollar, two above: below a dollar the third decimal is
+// the difference between two readings, and above one it is noise. The same
+// split `$/call` uses, so a turn and a call are read on one scale.
+function formatFineUsd(value) {
+  return `$${value.toFixed(value < 1 ? 3 : 2)}`;
+}
+
+/**
+ * A token count as context rather than as an accounting figure: 331K, not
+ * 331,204. The same thresholds the dashboard uses, so one session reads the
+ * same on both surfaces.
+ */
+function tokenLabel(value) {
+  if (value >= 1e9) return `${(value / 1e9).toFixed(2)}B`;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M`;
+  if (value >= 1e4) return `${Math.round(value / 1e3)}K`;
+  return tokenFormat.format(Math.round(value));
+}
+
 export function humanHotspots(analysis) {
   if (!analysis.recommendations.length) return "No cost hotspots found in this period.";
-  return ["agent-finops hotspots", ...analysis.recommendations.flatMap((item) => [
+  const quantified = analysis.recommendations.filter((item) => item.estimatedSavingsUsd != null);
+  const total = analysis.totalEstimatedSavingsUsd ?? quantified.reduce((sum, item) => sum + item.estimatedSavingsUsd, 0);
+  const lines = ["agent-finops hotspots"];
+  // The list is ranked whether or not anything carries a figure, but saying so
+  // is only informative when there is a figure to rank by.
+  if (quantified.length) lines.push(`Ranked by estimated upper-bound savings · ${formatUsd(total)} total across ${quantified.length} quantified finding${quantified.length === 1 ? "" : "s"}`);
+  for (const item of analysis.recommendations) {
+    lines.push(
+      "",
+      `[${item.severity}] ${item.kind}${item.estimatedSavingsUsd == null ? "" : ` · up to ${formatUsd(item.estimatedSavingsUsd)}`}`,
+      `  Evidence: ${item.evidence}`,
+      `  Next: ${item.action}`,
+    );
+  }
+  lines.push(
     "",
-    `[${item.severity}] ${item.kind}`,
-    `  Evidence: ${item.evidence}`,
-    `  Next: ${item.action}`,
-  ])].join("\n");
+    "Every figure here is a local estimate from list prices, not a bill. Savings are upper bounds on this same workload — what the window would have cost with the change already in place — not a forecast of what the next one will cost.",
+  );
+  return lines.join("\n");
 }
 
 /**
@@ -506,20 +742,45 @@ export function humanComparison(comparison) {
   return lines.join("\n");
 }
 
-export function humanSessions(sessions) {
+/**
+ * The project a session ran under, named by the local label when it has one. An
+ * unlabelled id is shortened: the row is about the session, and the full
+ * fingerprint the `project` command takes is what `projects` prints. A record
+ * with no project id leaves the session unattributed rather than inventing one.
+ */
+function sessionProjectColumn(session, labels) {
+  if (!session.project) return "unattributed";
+  return `project ${labels[session.project] || session.project.slice(0, 6)}`;
+}
+
+/**
+ * One session row. A bare fingerprint and a dollar figure are not something
+ * anyone can act on; the project it ran under and the context it hauls into
+ * every turn are what turn it into a diagnosis, and both are already on the
+ * record.
+ */
+function sessionLine(session, labels) {
+  return [
+    `  ${session.id}`,
+    formatUsd(session.usd).padStart(10),
+    `${tokenFormat.format(session.usage.total).padStart(14)} tokens`,
+    `${session.requests} turns`,
+    `${tokenLabel(session.avgPromptTokens || 0)} ctx/turn`,
+    sessionProjectColumn(session, labels),
+  ].join("  ");
+}
+
+export function humanSessions(sessions, labels = {}) {
   if (!sessions.length) return "No sessions found in this period.";
-  const number = tokenFormat;
   const lines = ["Sessions (anonymous local IDs):"];
-  for (const session of sessions) lines.push(`  ${session.id}  ${formatUsd(session.usd)}  ${number.format(session.usage.total)} tokens  ${session.requests} turns`);
+  for (const session of sessions) lines.push(sessionLine(session, labels));
   lines.push("", "Use `agent-finops session ID` for one session or `compare-sessions A B` for a direct comparison.");
   return lines.join("\n");
 }
 
-// $/call at 3 decimals under a dollar and 2 above: below a dollar the third
-// decimal is the difference between two tools, and above one it is noise.
 function formatUsdPerCall(usd) {
   if (usd == null) return "n/a";
-  return `$${usd.toFixed(usd < 1 ? 3 : 2)}/call`;
+  return `${formatFineUsd(usd)}/call`;
 }
 
 function formatSoloShare(share) {
@@ -564,28 +825,145 @@ function costClassLine(report) {
   return `Cost by class: ${parts.join(" · ")}${ttl}`;
 }
 
-export function humanReport(report) {
+/**
+ * The one line that states a token share and a dollar share together. Read on
+ * its own, "cache-read share 96.7%" sits directly under "cache-read $2,710.50
+ * (53%)" and the two look like a contradiction — which is the exact confusion
+ * this tool exists to remove. Both denominators are named in the sentence, the
+ * cost share is the same figure the cost-by-class line above already printed, and
+ * the rate that explains the whole gap is stated after them.
+ *
+ * With nothing priced there is no second share to contrast, so the line states
+ * the token half and says why the other half is missing rather than printing a
+ * zero. No prompt tokens at all means no line.
+ */
+function cacheReadLine(report) {
+  const share = report.insights?.cacheReadShare;
+  if (share == null) return null;
+  const tokens = `Cache reads are ${(share * 100).toFixed(1)}% of prompt tokens`;
+  const byClass = report.total?.usdByClass;
+  const totalUsd = report.total?.usd || 0;
+  if (!byClass || !totalUsd) return `${tokens}; nothing in this window is priced, so there is no cost share to set against that.`;
+  const costShare = (byClass.cacheRead || 0) / totalUsd;
+  return `${tokens} but ${Math.round(costShare * 100)}% of estimated cost — a cache read bills at ${CACHE_READ_MULTIPLIER}x the input rate.`;
+}
+
+// Two rows a side in the terminal: the block sits inside the summary stanza,
+// where a longer list would push the readings it qualifies off a screen.
+const CHANGED_ROW_LIMIT = 2;
+
+/** A delta with its direction in front of it, so a column of them scans. */
+function signedUsd(value) {
+  return `${value < 0 ? "-" : "+"}${formatUsd(Math.abs(value))}`;
+}
+
+function windowPair(days) {
+  return `last ${days} day${days === 1 ? "" : "s"} vs previous ${days}`;
+}
+
+/**
+ * Where the money moved between the two windows a trend compared. "Estimated
+ * spend rose 40%" with no subject is a reading an operator has to go somewhere
+ * else to finish, and `analyzeTrend` already ranks the per-key dollar deltas
+ * that finish it.
+ *
+ * Descriptive only: a row at the top of this list is where the money moved, not
+ * the reason it moved, and the closing line says so. No trend, or a trend where
+ * nothing moved, prints nothing rather than a heading over an empty list.
+ */
+function whatChangedLines(trend, labels) {
+  const models = (trend?.drivers?.byModel || []).slice(0, CHANGED_ROW_LIMIT);
+  const projects = (trend?.drivers?.byProject || []).slice(0, CHANGED_ROW_LIMIT);
+  if (!models.length && !projects.length) return [];
+  const pct = trend.deltaPct == null ? "n/a" : `${(trend.deltaPct * 100).toFixed(1)}%`;
+  const lines = [`What changed: ${windowPair(trend.days)} · ${formatUsd(trend.previous?.report?.total?.usd || 0)} → ${formatUsd(trend.current?.report?.total?.usd || 0)} (${pct})`];
+  for (const row of models) lines.push(`  model    ${String(row.model).padEnd(28)} ${signedUsd(row.deltaUsd)}`);
+  for (const row of projects) lines.push(`  project  ${displayProject(row.id, labels).padEnd(28)} ${signedUsd(row.deltaUsd)}`);
+  lines.push("  Where the money moved between those windows, not why it moved; compare tagged, matched task windows before attributing it to a change.");
+  return lines;
+}
+
+// The multiple of the median day that makes a day worth naming. Below it the
+// peak is just the busiest day of a normal week; at or above it, something
+// happened that day and the report should point at it.
+const PEAK_DAY_RATIO = 2;
+
+/**
+ * What the window costs per day, and what that pace comes to over a month. A
+ * total is not a rate: the same $5,000 is unremarkable over a quarter and worth
+ * stopping for over a week, and the report has to say which this is. Stated as a
+ * pace on the workload that already ran — never a forecast, never a bill.
+ */
+function runRateLine(report) {
+  const rate = report.insights?.runRate;
+  if (!rate) return null;
+  const peak = rate.peakDay;
+  const anomaly = peak?.ratioToMedian != null && peak.ratioToMedian >= PEAK_DAY_RATIO
+    ? ` · peak ${peak.day} ${formatUsd(peak.usd)} (${peak.ratioToMedian.toFixed(1)}x the median day)`
+    : "";
+  return `Run rate: ${formatUsd(rate.usdPerDay)}/day over ${rate.days} active day(s) · ~${formatPaceUsd(rate.projectedMonthlyUsd)}/${PROJECTION_DAYS}d at this pace${anomaly}`;
+}
+
+/**
+ * The shape of a turn, not just its average. The gap between the median and the
+ * mean is the whole reading: when a handful of turns costs twenty times the
+ * usual one, the mean describes no turn that ever ran.
+ */
+function perTurnLine(report) {
+  const turn = report.insights?.perTurnUsd;
+  if (!turn) return null;
+  return `Cost per turn: median ${formatFineUsd(turn.p50)} · mean ${formatFineUsd(turn.mean)} · p90 ${formatFineUsd(turn.p90)}`;
+}
+
+/**
+ * `labels` are the local names from `agent-finops label`, keyed by project id.
+ * They are optional in both directions: an unlabelled id prints as itself, and a
+ * caller with no labels file at all passes nothing.
+ *
+ * `trend` is optional context this report cannot hold on its own: the same
+ * `analyzeTrend` result the hotspot rules read, used only to name what moved.
+ * Absent — a caller with no history, or one that never asked for it — the report
+ * is exactly what it was before.
+ */
+export function humanReport(report, labels = {}, trend = null) {
   const number = tokenFormat;
   const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
-  const percent = (value) => (value == null ? "n/a" : `${(value * 100).toFixed(1)}%`);
   const u = report.total.usage;
   const byClass = costClassLine(report);
+  const runRate = runRateLine(report);
+  const perTurn = perTurnLine(report);
+  const cacheRead = cacheReadLine(report);
   const lines = [
     "agent-finops — local-only estimate",
     `Scope: ${report.scope.recordsAfterDateFilter.toLocaleString()} usage records before keep-last deduplication`,
     `Estimated cost: ${usd.format(report.total.usd)}${report.total.unpricedTokens ? " (partial; unpriced models present)" : ""}`,
+    ...(runRate ? [runRate] : []),
+    // Directly under the rate: "spend rose" and "here is what rose" are one
+    // reading, and splitting them across the report makes the first unusable.
+    ...whatChangedLines(trend, labels),
     `Tokens: ${number.format(u.total)}  input ${number.format(u.input)}  cache-write ${number.format(u.cacheCreate)}  cache-read ${number.format(u.cacheRead)}  output ${number.format(u.output)}`,
     ...(byClass ? [byClass] : []),
-    `Cache-read share: ${percent(report.insights.cacheReadShare)} · output-cost share: ${percent(report.insights.outputCostShare)}`,
+    ...(cacheRead ? [cacheRead] : []),
+    ...(perTurn ? [perTurn] : []),
     "",
     "By model:",
   ];
   for (const [model, value] of Object.entries(report.byModel)) {
     lines.push(`  ${model.padEnd(24)} ${usd.format(value.usd).padStart(10)}  ${number.format(value.usage.total).padStart(12)} tokens  ${value.requests} turns`);
   }
+  // Where the work happened, which is the dimension anyone running several agent
+  // workspaces at once actually steers by. A project id is a salted local
+  // fingerprint and never a path, so it is only a name once someone gives it one.
+  if (report.topProjects?.length) {
+    lines.push("", "By project:");
+    for (const value of report.topProjects) {
+      lines.push(`  ${displayProject(value.id, labels).padEnd(28)} ${usd.format(value.usd).padStart(10)}  ${number.format(value.usage.total).padStart(12)} tokens  ${value.requests} turns`);
+    }
+    lines.push("  Project paths are never stored or printed. Use `agent-finops label PROJECT_ID \"Name\"` to label an id locally.");
+  }
   if (report.topSessions.length) {
     lines.push("", "Top anonymous sessions:");
-    for (const value of report.topSessions) lines.push(`  ${value.id}  ${usd.format(value.usd)}  ${number.format(value.usage.total)} tokens`);
+    for (const value of report.topSessions) lines.push(sessionLine(value, labels));
   }
   if (report.topTools?.length) {
     lines.push("", "Top tool/MCP follow-on estimates:");

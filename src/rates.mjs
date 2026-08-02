@@ -41,9 +41,15 @@ export const PRICING_VERSION = 2;
 // `message.usage.cache_creation`, so the TTL is read per turn rather than
 // assumed. Turns predating that field carry only the total and are priced at
 // the 5-minute rate, which is the conservative floor.
-const CACHE_WRITE_5M_MULTIPLIER = 1.25;
-const CACHE_WRITE_1H_MULTIPLIER = 2;
-const CACHE_READ_MULTIPLIER = 0.1;
+// Exported because a TTL counterfactual is arithmetic on exactly these two
+// numbers. A second copy in the recommendation rules would be a rate table that
+// nothing prices against and nothing keeps in step with this one.
+export const CACHE_WRITE_5M_MULTIPLIER = 1.25;
+export const CACHE_WRITE_1H_MULTIPLIER = 2;
+// Exported for the same reason: the report states this multiple in prose to
+// explain why a class can be most of the tokens and a fraction of the dollars.
+// A hand-written "0.1x" beside the sentence would be a second rate table.
+export const CACHE_READ_MULTIPLIER = 0.1;
 
 /** Split cache-write tokens by TTL, charging any unclassified remainder at 5m. */
 export function cacheWriteSplit(usage) {

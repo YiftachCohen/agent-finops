@@ -10,6 +10,7 @@ import { boundaryToMs, durationToMs, listLimit, parseArgs, sinceToMs, timeWindow
 import { renderDashboard } from "../src/dashboard.mjs";
 import { indexedRecords, loadIndex } from "../src/index.mjs";
 import { buildReport } from "../src/report.mjs";
+import { analyzeTrend } from "../src/trends.mjs";
 
 const run = promisify(execFile);
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "cli.mjs");
@@ -57,6 +58,50 @@ test("CLI produces a JSON report without prompt content", async () => {
     assert.ok(!stdout.includes(root), "no log-dir path");
     assert.ok(!stdout.includes(index), "no index path");
     assert.ok(!/\/(Users|home)\//.test(stdout), "no home-directory path");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("report names what changed between the last two weeks, and --json is unaffected", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-finops-changed-"));
+  try {
+    mkdirSync(join(root, "project"));
+    const index = join(root, "index.json");
+    // Relative to now, because the trend windows are the last seven *complete*
+    // UTC days and the seven before them. A day inside each window is all this
+    // needs, and a fixed date would rot the moment the calendar passed it.
+    const daysAgo = (days) => new Date(Date.now() - days * 86_400_000).toISOString();
+    const turn = (id, model, days, output) => JSON.stringify({
+      type: "assistant",
+      requestId: id,
+      timestamp: daysAgo(days),
+      message: { id, model, content: SECRET, usage: { input_tokens: 0, output_tokens: output } },
+    });
+    writeFileSync(join(root, "project", "session.jsonl"), [
+      // $15 + $5 previous week, $45 + $1 this week: sonnet rose $30, haiku fell $4.
+      turn("r1", "claude-sonnet-4-6", 8, 1e6),
+      turn("r2", "claude-haiku-4-5", 8, 1e6),
+      turn("r3", "claude-sonnet-4-6", 1, 3e6),
+      turn("r4", "claude-haiku-4-5", 1, 2e5),
+    ].join("\n"));
+
+    const { stdout } = await run("node", [CLI, "report", "--log-dir", root, "--index", index, "--fresh"]);
+    const lines = stdout.split("\n");
+    assert.equal(lines[lines.findIndex((row) => row.startsWith("What changed:")) - 1].startsWith("Run rate:"), true);
+    assert.match(stdout, /What changed: last 7 days vs previous 7 · \$20\.00 → \$46\.00 \(130\.0%\)\n/);
+    assert.match(stdout, /\n {2}model {4}claude-sonnet-4-6 {12}\+\$30\.00\n/);
+    assert.match(stdout, /\n {2}model {4}claude-haiku-4-5 {13}-\$4\.00\n/);
+    // One project directory, so both models moved the same project by $26 net.
+    assert.match(stdout, /\n {2}project {2}[a-f0-9]{12} {17}\+\$26\.00\n/);
+    assert.match(stdout, /not why it moved/);
+    assert.ok(!stdout.includes(SECRET));
+
+    // The shared artifact is untouched: no trend, no block, and no new key.
+    const json = (await run("node", [CLI, "report", "--json", "--log-dir", root, "--index", index])).stdout;
+    assert.ok(!json.includes("What changed"));
+    assert.ok(!json.includes("changed"));
+    assert.equal(JSON.parse(json).total.requests, 4);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -417,11 +462,29 @@ test("the per-install salt never leaves the index file", async () => {
 
     const sessions = JSON.parse((await run("node", [CLI, "sessions", "--json", "--index", index])).stdout);
     const projectRows = JSON.parse((await run("node", [CLI, "projects", "--json", "--index", index])).stdout);
+
+    // A local label is the newest thing to reach terminal output: `report`,
+    // `sessions`, `session`, and `projects` all name an anonymous id with one
+    // now. The name is the user's own and holds no path, but the lines that
+    // print it are still lines, and they must carry no salt and no prompt
+    // content either. Checked before the rescanning commands below, which
+    // re-fingerprint every id against the substituted salt.
+    await run("node", [CLI, "label", projectRows[0].id, "Payments API"], { env: { ...process.env, ...env } });
+    for (const command of [["report"], ["sessions"], ["session", sessions[0].id], ["projects"]]) {
+      const { stdout } = await run("node", [CLI, ...command, "--log-dir", root, "--index", index], { env: { ...process.env, ...env } });
+      assert.ok(stdout.includes("Payments API"), `${command[0]} should name the labelled project`);
+      assert.ok(!stdout.includes(SALT), `${command[0]} leaked the salt beside a label`);
+      assert.ok(!stdout.includes(SECRET), `${command[0]} leaked prompt content beside a label`);
+    }
+    // A label is a local name for an id, not a fact about the workload: it names
+    // rows in the terminal and stays out of the JSON people share.
+    assert.ok(!(await run("node", [CLI, "report", "--json", "--log-dir", root, "--index", index], { env: { ...process.env, ...env } })).stdout.includes("Payments API"));
+
     const commands = [
       ["report", "--json"], ["report"],
       ["hotspots", "--json"], ["hotspots"],
       ["tools", "--json"], ["mcp", "--json"],
-      ["sessions", "--json"], ["projects", "--json"], ["projects"],
+      ["sessions", "--json"], ["sessions"], ["projects", "--json"], ["projects"],
       ["trend", "--json"], ["trend"],
       ["session", sessions[0].id, "--json"],
       ["project", projectRows[0].id, "--json"], ["project", projectRows[0].id],
@@ -440,16 +503,26 @@ test("the per-install salt never leaves the index file", async () => {
 
     // `dashboard` serves rather than prints, so its page is rendered from the
     // same report object the JSON commands emit and checked directly. It is the
-    // one view that also carries local project labels, so it renders with them.
+    // one view that also carries local project labels, so it renders with them —
+    // and, like the real command, the trend its "what changed" section reads.
     const dashboardRecords = indexedRecords(loadIndex(index));
     const page = renderDashboard(
       buildReport(dashboardRecords, { sessionLimit: 12, toolLimit: 12, projectLimit: 12 }),
       { recommendations: [] },
       Object.fromEntries(dashboardRecords.filter((record) => record.project).map((record) => [record.project, "Payments API"])),
+      analyzeTrend(dashboardRecords, { days: 7, now: new Date("2026-08-03T00:00:00Z") }),
     );
     assert.ok(!page.includes(SALT), "the dashboard page leaked the salt");
     assert.ok(!page.includes(SECRET), "the dashboard page leaked prompt content");
     assert.ok(page.includes("Payments API"), "a labelled project should reach the page");
+    // The driver rows are the newest thing to reach the page, and they are built
+    // from project ids: a label or a six-character prefix, never the salted id
+    // itself and never the two nested reports the trend carries.
+    const changed = JSON.parse(/const DATA = (.*);\n/.exec(page)[1]).changed;
+    assert.ok(changed, "the section receives the trend the command built");
+    assert.ok(!JSON.stringify(changed).includes(SALT));
+    assert.ok(!JSON.stringify(changed).includes(SECRET));
+    for (const row of changed.byProject) assert.ok(!dashboardRecords.some((record) => record.project === row.name), "a full project fingerprint reached the page");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

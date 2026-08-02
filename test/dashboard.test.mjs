@@ -114,6 +114,64 @@ test("a report from before this release still renders, with no label and no dist
   assert.equal(data.tools[0].soloShare, null);
 });
 
+test("the readings row carries the run rate and what the ranked findings add up to", () => {
+  const runRate = { days: 30, firstDay: "2026-07-04", lastDay: "2026-08-02", usdPerDay: 170.6, projectedMonthlyUsd: 5118, peakDay: { day: "2026-07-28", usd: 351.83, ratioToMedian: 2.3 } };
+  const page = renderDashboard({ ...report, insights: { ...report.insights, runRate } }, {
+    totalEstimatedSavingsUsd: 1977.3,
+    recommendations: [
+      { severity: "high", kind: "model-concentration", evidence: "Opus is most of it.", action: "Try a tagged run.", estimatedSavingsUsd: 1968.3 },
+      { severity: "info", kind: "cache-ttl", evidence: "Most writes are 1-hour.", action: "Measure both cadences.", estimatedSavingsUsd: 9 },
+      { severity: "medium", kind: "output-cost", evidence: "Output is high.", action: "Constrain it." },
+    ],
+  });
+  const data = payloadOf(page);
+
+  assert.deepEqual(data.insights.runRate, runRate);
+  // The total the analysis already ranks by, with the count of rows it came
+  // from: an upper bound across findings, never a total of the window.
+  assert.equal(data.savings.totalUsd, 1977.3);
+  assert.equal(data.savings.quantifiedFindings, 2, "the unquantified finding is not counted as a zero");
+
+  // The two readings a spend figure is unreadable without replace the two token
+  // shares the cost-by-class legend and bars already say better.
+  assert.match(page, /<p class="micro">run rate<\/p>/);
+  assert.match(page, /<p class="micro">identified savings<\/p>/);
+  assert.match(page, /per active day \/ ~/);
+  assert.match(page, /upper bound across/);
+  assert.ok(!page.includes("cache-read share"), "the token-share reading is gone");
+  assert.ok(!page.includes("output-cost share"), "the output-share reading is gone");
+  // The two readings that were already the right ones stay exactly as they were.
+  assert.match(page, /<p class="micro">token volume<\/p>/);
+  assert.match(page, /<p class="micro">cost per turn<\/p>/);
+});
+
+test("a window with no rate and nothing quantified reads as a dash, not as a zero", () => {
+  // Tag-shaped and older-index data carries no run rate at all, and an analysis
+  // where no rule could defend a counterfactual carries no total.
+  const data = payloadOf(renderDashboard(report, { recommendations: [{ severity: "medium", kind: "output-cost", evidence: "Output is high.", action: "Constrain it." }] }));
+  assert.equal(data.insights.runRate, undefined);
+  assert.equal(data.savings.totalUsd, 0);
+  assert.equal(data.savings.quantifiedFindings, 0);
+
+  // An analysis from before `totalEstimatedSavingsUsd` existed is summed from
+  // the rows rather than left blank.
+  const legacy = payloadOf(renderDashboard(report, {
+    recommendations: [
+      { severity: "high", kind: "model-concentration", evidence: "e", action: "a", estimatedSavingsUsd: 12 },
+      { severity: "info", kind: "cache-ttl", evidence: "e", action: "a", estimatedSavingsUsd: 3 },
+    ],
+  }));
+  assert.equal(legacy.savings.totalUsd, 15);
+  assert.equal(legacy.savings.quantifiedFindings, 2);
+
+  // Both readings fall back to a dash and a neutral note rather than inventing
+  // a rate or claiming there is nothing to save.
+  const page = renderDashboard(report, { recommendations: [] });
+  assert.match(page, /runRate \? money\(runRate\.usdPerDay\) : '—'/);
+  assert.match(page, /'no dated records in this window'/);
+  assert.match(page, /'nothing quantified in this window'/);
+});
+
 test("tool rows carry per-call cost and solo share, and the row detail names both in the same lowercase voice", () => {
   const usage = { input: 100, cacheCreate: 0, cacheRead: 0, output: 100, total: 200 };
   const page = renderDashboard({
@@ -133,9 +191,140 @@ test("tool rows carry per-call cost and solo share, and the row detail names bot
   // The client-side detail line is composed from these two fields; the
   // formatting helpers and the "of attributed cost" phrasing travel as source
   // in the inert script, in the same lowercase voice as the rest of the page.
-  assert.match(page, /perCallMoney/);
+  // $/call and $/turn share one helper, so the two cannot drift apart.
+  assert.match(page, /fineMoney/);
   assert.match(page, /% of attributed cost/);
   assert.match(page, /solo n\/a/);
+});
+
+test("recommendations reach the page ranked, each carrying its estimated saving", () => {
+  const page = renderDashboard(report, {
+    totalEstimatedSavingsUsd: 1977.3,
+    recommendations: [
+      { severity: "high", kind: "model-concentration", evidence: "Opus is most of it.", action: "Try a tagged run.", estimatedSavingsUsd: 1968.3 },
+      { severity: "info", kind: "cache-ttl", evidence: "Most writes are 1-hour.", action: "Measure both cadences.", estimatedSavingsUsd: 9 },
+      { severity: "medium", kind: "output-cost", evidence: "Output is high.", action: "Constrain it." },
+    ],
+  });
+  const data = payloadOf(page);
+
+  // The order the analysis produced is the order the page renders; the dashboard
+  // does not re-sort, so the two surfaces cannot disagree on what to do first.
+  assert.deepEqual(data.recommendations.map((rec) => [rec.kind, rec.estimatedSavingsUsd]), [
+    ["model-concentration", 1968.3],
+    ["cache-ttl", 9],
+    // An analysis built before this field existed, or a rule with no defensible
+    // counterfactual, falls back to null rather than a zero it cannot support.
+    ["output-cost", null],
+  ]);
+  // The figure is rendered above the severity word in the same column, and the
+  // heading says what the list is ordered by.
+  assert.match(page, /note-savings/);
+  assert.match(page, /rec\.estimatedSavingsUsd != null/);
+  assert.match(page, /ranked by estimated savings/);
+});
+
+// A trend as `analyzeTrend` returns one, reduced to the fields the page reads.
+// The nested reports are deliberately present here and deliberately absent from
+// the payload: the browser gets deltas, not a second copy of every bucket.
+function trendFixture(overrides = {}) {
+  return {
+    days: 7,
+    current: { start: "2026-07-26", end: "2026-08-01", report: { total: { usd: 1690 } } },
+    previous: { start: "2026-07-19", end: "2026-07-25", report: { total: { usd: 1204 } } },
+    deltaUsd: 486,
+    deltaPct: 0.4036544850498339,
+    drivers: { byModel: [], byProject: [] },
+    ...overrides,
+  };
+}
+
+test("the what-changed section carries the two windows and the rows that moved, top three a side", () => {
+  const trend = trendFixture({
+    drivers: {
+      byModel: [
+        { model: "claude-opus-4-5", deltaUsd: 512.4 },
+        { model: "claude-sonnet-4-6", deltaUsd: -33.6 },
+        { model: "claude-haiku-4-5", deltaUsd: 7.2 },
+        { model: "claude-opus-5", deltaUsd: 1.1 },
+      ],
+      byProject: [
+        { id: "112233445566", deltaUsd: 480 },
+        { id: "667788990011", deltaUsd: -20 },
+        { id: "<unknown-project>", deltaUsd: 12 },
+        { id: "aabbccddeeff", deltaUsd: 3 },
+      ],
+    },
+  });
+  const page = renderDashboard(report, { recommendations: [] }, { 112233445566: "Payments API" }, trend);
+  const data = payloadOf(page);
+
+  assert.equal(data.changed.days, 7);
+  assert.deepEqual(data.changed.current, { start: "2026-07-26", end: "2026-08-01" });
+  assert.deepEqual(data.changed.previous, { start: "2026-07-19", end: "2026-07-25" });
+  // Three a side: past that the deltas are rounding against the headline.
+  assert.deepEqual(data.changed.byModel, [
+    { name: "claude-opus-4-5", deltaUsd: 512.4 },
+    { name: "claude-sonnet-4-6", deltaUsd: -33.6 },
+    { name: "claude-haiku-4-5", deltaUsd: 7.2 },
+  ]);
+  // A project delta is named on this side: the local label where there is one,
+  // a shortened fingerprint where there is not. The `<unknown-project>` bucket
+  // is left whole, because truncating it produces a word rather than an id.
+  assert.deepEqual(data.changed.byProject, [
+    { name: "Payments API", deltaUsd: 480 },
+    { name: "667788", deltaUsd: -20 },
+    { name: "<unknown-project>", deltaUsd: 12 },
+  ]);
+
+  // Aggregate-only: no fingerprint, no report, no window in milliseconds.
+  assert.deepEqual(Object.keys(data.changed).sort(), ["byModel", "byProject", "current", "days", "previous"]);
+  assert.ok(!JSON.stringify(data.changed).includes("112233445566"), "a full project id never crosses into the section");
+  assert.ok(!JSON.stringify(data.changed).includes("report"), "the two nested reports stay on the server");
+
+  // The section is its own hairline block between the readings and the ranking,
+  // and it says in the heading that it is descriptive.
+  assert.match(page, /<h2 class="micro">what changed \/ where the money moved, not why<\/h2>/);
+  assert.ok(page.indexOf('id="changed-section"') > page.indexOf('<section class="readings"'));
+  assert.ok(page.indexOf('id="changed-section"') < page.indexOf('id="ranking"'));
+  // Direction reads without colour: a leading sign, and ink brightness only.
+  assert.match(page, /const signedMoney = value => \(value < 0 \? '−' : '\+'\)/);
+  assert.match(page, /\.change-delta \{ text-align:right; color:var\(--ink\); opacity:\.55; \}/);
+  assert.ok(!/\.change-delta[^}]*(red|green|#[0-9a-f]{3})/i.test(page), "no hue is introduced for direction");
+});
+
+test("a dashboard with no trend to compare renders the section in its empty voice, never hidden", () => {
+  // No third argument at all is the legacy call, and the commonest cause is an
+  // index with less than two windows of history.
+  const bare = renderDashboard(report, { recommendations: [] });
+  assert.equal(payloadOf(bare).changed, null);
+  assert.match(bare, /id="changed-section"/, "the section still exists");
+  assert.match(bare, /'not enough history to compare two windows'/);
+
+  // Two real windows where nothing moved is a different silence, and the page
+  // carries a separate sentence for it rather than claiming there is no history.
+  const flat = payloadOf(renderDashboard(report, { recommendations: [] }, {}, trendFixture()));
+  assert.deepEqual(flat.changed.byModel, []);
+  assert.deepEqual(flat.changed.byProject, []);
+  assert.match(bare, /'no model or project moved between these two windows'/);
+  // Both empties are the page's existing empty voice, not a new one.
+  assert.match(bare, /empty\.className = 'empty'/);
+});
+
+test("a per-turn figure is three decimals under a dollar, not four", () => {
+  // $0.0902 is the reading that made this rule necessary: four decimals on a
+  // per-turn cost read as noise. `money` keeps its four for sub-cent figures
+  // elsewhere, where dropping them would print a real cost as $0.00.
+  const page = renderDashboard(report, { recommendations: [] });
+  assert.match(page, /const fineMoney = value => '\$' \+ value\.toFixed\(value < 1 \? 3 : 2\)/);
+  assert.match(page, /const money = value => value > 0 && value < 0\.1 \? cents\.format\(value\) : dollars\.format\(value\)/);
+  // The reading and its note are both on the fine helper; the legend, the day
+  // readout, and the savings reading are all still on `money`.
+  assert.match(page, /'per-turn'\)\.textContent = perTurn \? fineMoney\(perTurn\.p50\)/);
+  assert.match(page, /'median billed turn \/ mean ' \+ fineMoney\(perTurn\.mean\) \+ ' \/ p90 ' \+ fineMoney\(perTurn\.p90\)/);
+
+  const fineMoney = (value) => `$${value.toFixed(value < 1 ? 3 : 2)}`;
+  assert.deepEqual([0.0902, 0.015, 0.0009, 1.5, 12.345].map(fineMoney), ["$0.090", "$0.015", "$0.001", "$1.50", "$12.35"]);
 });
 
 test("loopback Host header rule accepts only this port on a loopback name", () => {
