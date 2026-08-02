@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo 'privacy audit needs ripgrep (rg): brew install ripgrep, or apt install ripgrep.' >&2
+  exit 1
+fi
+
 if rg -n -e 'fetch|https?:|node:net|node:https|WebSocket|XMLHttpRequest' src; then
   echo 'privacy audit failed: outbound network API or URL found in src' >&2
   exit 1
@@ -13,6 +18,11 @@ fi
 
 if ! rg -n 'host: LOOPBACK_HOST' src/dashboard.mjs >/dev/null || ! rg -n "connect-src 'none'" src/dashboard.mjs >/dev/null; then
   echo 'privacy audit failed: dashboard must bind to loopback and forbid browser connections' >&2
+  exit 1
+fi
+
+if ! rg -n 'isLoopbackHost' src/dashboard.mjs >/dev/null; then
+  echo 'privacy audit failed: dashboard must reject non-loopback Host headers (DNS rebinding)' >&2
   exit 1
 fi
 

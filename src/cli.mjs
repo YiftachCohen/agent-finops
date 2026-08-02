@@ -12,6 +12,9 @@ import { findClaudeJsonl } from "./logs.mjs";
 import { buildReport, compareSnapshots, hotspotAnalysis, humanComparison, humanHotspots, humanReport, humanSessions, humanTools } from "./report.mjs";
 import { analyzeTrend, humanTrend } from "./trends.mjs";
 
+// An index older than this is refreshed before any report is built.
+const INDEX_MAX_AGE_MS = 3_600_000;
+
 function usage(message = null) {
   console.log(message || `Usage:
   agent-finops scan [--log-dir PATH] [--index PATH]
@@ -23,7 +26,7 @@ function usage(message = null) {
   agent-finops sessions [--since 7d] [--limit 20] [--json] [--fresh]
   agent-finops session SESSION_ID [--since 7d] [--json] [--fresh]
   agent-finops compare-sessions LEFT_ID RIGHT_ID [--since 7d] [--json] [--fresh]
-  agent-finops projects [--since 7d] [--json] [--fresh]
+  agent-finops projects [--since 7d] [--limit 20] [--json] [--fresh]
   agent-finops label PROJECT_ID "Friendly name"
   agent-finops trend [--days 7] [--json] [--fresh]
   agent-finops tag NAME [--since 7d] [--fresh]
@@ -39,6 +42,12 @@ Everything is local. The index stores hashed IDs and token metadata only.`);
 }
 
 function parseArgs(argv) {
+  // A flag whose value is missing must fail loudly. Silently reading
+  // `undefined` turned `--since` with no argument into "no time filter at all".
+  const value = (argv, index, flag) => {
+    if (index >= argv.length) throw new Error(`${flag} requires a value.`);
+    return argv[index];
+  };
   const args = {
     command: argv[0] === "--help" || argv[0] === "-h" ? "report" : (argv[0] || "report"),
     positional: [],
@@ -54,18 +63,18 @@ function parseArgs(argv) {
   };
   if (argv[0] === "--help" || argv[0] === "-h") args.help = true;
   for (let i = 1; i < argv.length; i++) {
-    const value = argv[i];
-    if (value === "--json") args.json = true;
-    else if (value === "--fresh") args.fresh = true;
-    else if (value === "--since") args.since = argv[++i];
-    else if (value === "--older-than") args.olderThan = argv[++i];
-    else if (value === "--days") args.days = Number(argv[++i]);
-    else if (value === "--limit") args.limit = Number(argv[++i]);
-    else if (value === "--port") args.port = Number(argv[++i]);
-    else if (value === "--log-dir") args.logDir = argv[++i];
-    else if (value === "--index") args.indexPath = argv[++i];
-    else if (value === "--help" || value === "-h") args.help = true;
-    else args.positional.push(value);
+    const flag = argv[i];
+    if (flag === "--json") args.json = true;
+    else if (flag === "--fresh") args.fresh = true;
+    else if (flag === "--since") args.since = value(argv, ++i, flag);
+    else if (flag === "--older-than") args.olderThan = value(argv, ++i, flag);
+    else if (flag === "--days") args.days = Number(value(argv, ++i, flag));
+    else if (flag === "--limit") args.limit = Number(value(argv, ++i, flag));
+    else if (flag === "--port") args.port = Number(value(argv, ++i, flag));
+    else if (flag === "--log-dir") args.logDir = value(argv, ++i, flag);
+    else if (flag === "--index") args.indexPath = value(argv, ++i, flag);
+    else if (flag === "--help" || flag === "-h") args.help = true;
+    else args.positional.push(flag);
   }
   return args;
 }
@@ -107,16 +116,31 @@ async function scan(args) {
   return updated;
 }
 
+/**
+ * Age of an index in milliseconds. An absent or unparseable timestamp counts as
+ * infinitely old, so a malformed index is rescanned rather than trusted.
+ */
+function indexAgeMs(index) {
+  const scannedAt = Date.parse(index.scannedAt || "");
+  return Number.isFinite(scannedAt) ? Date.now() - scannedAt : Infinity;
+}
+
 async function reportFor(args) {
   let index = loadIndex(args.indexPath);
   let scanStats = null;
-  if (args.fresh || !index.scannedAt) {
+  // Rescan once the index ages out, not just when it is missing. `updateIndex`
+  // reuses every file whose mtime and size are unchanged, so the steady-state
+  // cost is a stat() per log, and a spend figure is never quietly served from a
+  // stale snapshot that reads exactly like "you have no usage".
+  if (args.fresh || indexAgeMs(index) > INDEX_MAX_AGE_MS) {
     const updated = await scan(args);
     index = updated.index;
     scanStats = updated.stats;
   }
   const report = buildReport(indexedRecords(index), { sinceMs: sinceToMs(args.since) });
-  report.index = { path: args.indexPath, scannedAt: index.scannedAt || null, scanStats };
+  // Deliberately no index path: `report --json` is the artifact people share,
+  // and an absolute path carries the local username. `doctor` prints paths.
+  report.index = { scannedAt: index.scannedAt || null, scanStats };
   return { index, report };
 }
 
@@ -173,7 +197,7 @@ async function main() {
     }
     if (args.command === "scan") {
       const updated = await scan(args);
-      const output = { indexPath: args.indexPath, scannedAt: updated.index.scannedAt, records: updated.records.length, ...updated.stats };
+      const output = { scannedAt: updated.index.scannedAt, records: updated.records.length, ...updated.stats };
       console.log(args.json ? JSON.stringify(output, null, 2) : `Indexed ${output.records.toLocaleString()} metadata records · ${output.filesParsed} files parsed · ${output.filesReused} reused · ${output.parseErrors} parse errors`);
       return;
     }
@@ -196,6 +220,9 @@ async function main() {
     const { index, report } = await reportFor(args);
     if (args.command === "dashboard") {
       const dashboardReport = buildReport(indexedRecords(index), { sinceMs: sinceToMs(args.since), sessionLimit: 12, toolLimit: 12 });
+      // Carry the scan timestamp onto the page so an index that predates the
+      // window is legible as a stale read rather than as an empty month.
+      dashboardReport.index = report.index;
       const running = await startDashboard(dashboardReport, hotspotAnalysis(dashboardReport), { port: args.port });
       console.log(`Dashboard running at ${running.url}`);
       console.log("Loopback only. Press Ctrl-C to stop.");
@@ -244,9 +271,11 @@ async function main() {
       return;
     }
     if (args.command === "projects") {
-      const output = projects(report, loadLabels());
+      const labels = loadLabels();
+      const projectReport = buildReport(indexedRecords(index), { sinceMs: sinceToMs(args.since), projectLimit: listLimit(args.limit) });
+      const output = projects(projectReport, labels);
       if (args.json) console.log(JSON.stringify(output, null, 2));
-      else console.log(["Projects:", ...output.map((item) => `  ${(item.label || item.id).padEnd(28)} $${item.usd.toFixed(2)}  ${item.tokens.toLocaleString()} tokens  ${item.requests} turns${item.label ? `  [${item.id}]` : ""}`), "", "Project paths are never stored or printed. Use `agent-finops label PROJECT_ID \"Name\"` to label an id locally."].join("\n"));
+      else console.log(["Projects:", ...output.map((item) => `  ${displayProject(item.id, labels).padEnd(28)} $${item.usd.toFixed(2)}  ${Math.round(item.tokens).toLocaleString()} tokens  ${item.requests} turns`), "", "Project paths are never stored or printed. Use `agent-finops label PROJECT_ID \"Name\"` to label an id locally."].join("\n"));
       return;
     }
     if (args.command === "trend") {

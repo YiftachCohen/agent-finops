@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 
 const TOP_TYPE_RE = /"type"\s*:\s*"([A-Za-z0-9_.-]+)"/;
 const ASSISTANT_ROLE_RE = /"role"\s*:\s*"assistant"/;
-const TOOL_USE_RE = /"type"\s*:\s*"tool_use"/g;
+const TOOL_RESULT_RE = /"type"\s*:\s*"tool_result"|"toolUseResult"\s*:/;
 const SAFE_TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_.:-]{0,159}$/;
 const SENSITIVE_KEYS = new Set([
   "content",
@@ -20,6 +20,15 @@ const SENSITIVE_KEYS = new Set([
   "command",
   "output",
   "reasoning_content",
+  // Tool-result envelopes carry captured terminal output. These records are
+  // rejected before decoding, but a line whose captured output happens to
+  // contain an assistant role marker reaches the decoder, so redact them too.
+  "stdout",
+  "stderr",
+  "toolUseResult",
+  "file",
+  "oldString",
+  "newString",
 ]);
 
 function skipWhitespace(text, start) {
@@ -62,20 +71,50 @@ function valueEnd(text, start) {
   return i;
 }
 
-/** Return the opening brace of the object enclosing an offset, without decoding values. */
-function enclosingObjectStart(text, offset) {
+/**
+ * Return the opening brace of every object holding `"type": "tool_use"`, in one
+ * forward pass. Rescanning from the start for each match made a large assistant
+ * line quadratic in its own length.
+ */
+function toolUseObjectStarts(text) {
+  const starts = [];
   const stack = [];
   let i = 0;
-  while (i < offset) {
-    if (text[i] === '"') {
-      i = stringEnd(text, i);
+  while (i < text.length) {
+    const c = text[i];
+    if (c === "{") {
+      stack.push(i);
+      i++;
       continue;
     }
-    if (text[i] === "{") stack.push(i);
-    else if (text[i] === "}") stack.pop();
-    i++;
+    if (c === "}") {
+      stack.pop();
+      i++;
+      continue;
+    }
+    if (c !== '"') {
+      i++;
+      continue;
+    }
+    const keyEnd = stringEnd(text, i);
+    if (stack.length && text.slice(i + 1, keyEnd - 1) === "type") {
+      const colon = skipWhitespace(text, keyEnd);
+      if (text[colon] === ":") {
+        const start = skipWhitespace(text, colon + 1);
+        if (text[start] === '"' && text.slice(start + 1, stringEnd(text, start) - 1) === "tool_use") starts.push(stack.at(-1));
+      }
+    }
+    i = keyEnd;
   }
-  return stack.at(-1) ?? null;
+  return starts;
+}
+
+/**
+ * True when a line is a tool-result envelope rather than a fresh human turn.
+ * Follow-on attribution stays open across these and closes on anything else.
+ */
+export function isToolResultLine(raw) {
+  return TOOL_RESULT_RE.test(raw);
 }
 
 /** Read a direct string property from one JSON object using only lexical scans. */
@@ -109,11 +148,7 @@ export function toolNamesFromClaudeRawLine(raw) {
   const type = TOP_TYPE_RE.exec(raw)?.[1];
   if (type !== "assistant" && !ASSISTANT_ROLE_RE.test(raw)) return [];
   const names = new Set();
-  TOOL_USE_RE.lastIndex = 0;
-  let match;
-  while ((match = TOOL_USE_RE.exec(raw))) {
-    const objectStart = enclosingObjectStart(raw, match.index);
-    if (objectStart == null) continue;
+  for (const objectStart of toolUseObjectStarts(raw)) {
     const name = objectStringProperty(raw, objectStart, "name");
     if (name && SAFE_TOOL_NAME_RE.test(name)) names.add(name);
   }
@@ -159,8 +194,11 @@ function nonNegativeInt(value) {
   return Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
-/** Return only the metadata required for accounting, or null. */
-export function recordFromClaudeRawLine(raw, source) {
+/**
+ * Return only the metadata required for accounting, or null. `tools` may be
+ * supplied by a caller that already scanned the line, to avoid a second pass.
+ */
+export function recordFromClaudeRawLine(raw, source, tools = null) {
   const type = TOP_TYPE_RE.exec(raw)?.[1];
   // Claude Code has two observed envelopes: direct `type: assistant` records and
   // `type: message` records with `message.role: assistant`. Reject everything
@@ -201,7 +239,7 @@ export function recordFromClaudeRawLine(raw, source) {
     requestId: typeof parsed.requestId === "string" ? parsed.requestId : null,
     model,
     timestamp,
-    tools: toolNamesFromClaudeRawLine(raw),
+    tools: tools ?? toolNamesFromClaudeRawLine(raw),
     usage: normalizedUsage,
   };
 }

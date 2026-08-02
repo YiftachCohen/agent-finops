@@ -5,8 +5,9 @@ request, read the privacy boundary in [SECURITY.md](SECURITY.md).
 
 ## Development
 
-Requirements: Node.js 20 or newer. The project intentionally has no runtime
-dependencies.
+Requirements: Node.js 20 or newer, plus
+[ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) for the audit scripts.
+The project intentionally has no runtime dependencies.
 
 ```sh
 npm test

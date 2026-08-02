@@ -17,7 +17,14 @@ The default data boundary is deliberately narrow:
 
 This is a cost-management tool, not an invoice. Its rate table is local and
 versioned in source. Bedrock region, cross-region, negotiated, and TTL-specific
-pricing can differ from the estimate.
+pricing can differ from the estimate. Specifically:
+
+- Cache writes are priced at the 5-minute TTL (1.25x input). A 1-hour TTL costs
+  2x, and the JSONL does not record which TTL a turn used.
+- Fast mode bills at a premium but is not distinguishable in the log, so a
+  fast-mode turn is estimated at the standard rate for its model.
+- Introductory pricing is applied by the timestamp on each turn, so a report
+  spanning a price change prices each turn with the rate then in effect.
 
 ## Open source and contributing
 
@@ -28,6 +35,11 @@ credentials, local indexes, or production billing data; synthetic examples are
 enough to reproduce behavior.
 
 ## Install and use
+
+Requirements: Node.js 20 or newer for the CLI itself, plus
+[ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) for the audit scripts
+(`brew install ripgrep` or `apt install ripgrep`). Reporting never shells out;
+ripgrep is only used by `npm run audit` and `npm run public-audit`.
 
 ```sh
 cd ~/projects/agent-finops
@@ -42,7 +54,7 @@ agent-finops tools --since 7d
 agent-finops mcp --since 7d
 agent-finops sessions --since 7d --limit 20
 agent-finops compare-sessions SESSION_A SESSION_B --since 7d
-agent-finops projects
+agent-finops projects --limit 20
 agent-finops label d78a771feca2 "Billing app"
 agent-finops tag baseline-24h --since 24h --fresh
 agent-finops compare baseline-24h boost-24h
@@ -54,6 +66,10 @@ agent-finops doctor
 
 By default it reads `~/.claude/projects`. Use `--log-dir` or
 `AGENT_FINOPS_LOG_DIR` for a different Claude configuration directory.
+
+`--json` output contains no filesystem paths, so a report can be shared without
+disclosing a local username. Run `doctor` when you need to see which index and
+log directory are in use.
 
 ### Deploy on a work laptop
 
@@ -102,8 +118,10 @@ the evidence-backed cost-reduction experiments from `hotspots`.
 
 It binds exclusively to `127.0.0.1` (never the LAN), serves no API, has no
 external assets or browser connections, and receives only aggregate metadata
-already present in the private index. Use `--port 0` to choose a random local
-port, or `--fresh` to scan before serving.
+already present in the private index. It also rejects any request whose `Host`
+header is not loopback, so a public site cannot point its own hostname at
+`127.0.0.1` and read the page as same-origin. Use `--port 0` to choose a random
+local port, or `--fresh` to scan before serving.
 
 `trend --days 7` compares the most recent seven calendar days with the seven
 before them and prints daily history. `projects` groups the same cost by an
@@ -126,6 +144,10 @@ so all tool rows add up rather than double-counting a turn. This identifies
 costly **cohorts** such as a wide MCP schema or oversized result, but it is not
 an invoice line item and cannot prove a tool caused all following cost.
 
+A cohort spans only the tool call and the turns that answer it. A new human
+prompt ends the cohort, so turns you type after a tool ran are not charged to
+that tool.
+
 Only a tool's safe name is retained—never its arguments, result, tool id,
 prompt, or working-directory path. Existing indexes are automatically rebuilt
 once after this version so they gain the new metadata.
@@ -141,7 +163,9 @@ The metering commands do not alter Claude Code. The optional hook below is the
 cost-reduction feature: it deterministically reduces long, noisy Bash `stdout`
 *after the command executes* and before the result returns to Claude. It never
 changes `stderr`, images, or short output. It preserves head/tail lines and
-diagnostic lines (`error`, `fail`, `warning`, etc.).
+diagnostic lines (`error`, `fail`, `warning`, etc.). When even the head and tail
+exceed the budget, the middle is cut and both ends are kept, because the end of
+a build or test run is where the failure summary lives.
 
 When it reduces output, the full original stdout/stderr is retained locally under
 `~/.local/share/agent-finops/filter/artifacts`, mode `0600`, and Claude receives

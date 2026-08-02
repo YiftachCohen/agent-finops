@@ -50,6 +50,32 @@ test("hook replaces only noisy stdout, preserves stderr, and retains a private a
   }
 });
 
+test("compressor keeps the tail when head lines are long", () => {
+  // A build log whose lines are wide enough that head + tail alone overflow the
+  // budget. The failure summary lives at the end, so it must survive.
+  const wide = Array.from({ length: 300 }, (_, i) => `L${i} ${"y".repeat(300)}`).join("\n");
+  const result = compactStdout(wide);
+  assert.equal(result.changed, true);
+  assert.ok(result.sentChars <= 12_000);
+  assert.ok(result.stdout.startsWith("L0 "), "head is preserved");
+  assert.match(result.stdout, /L299 /, "tail is preserved");
+});
+
+test("compressor keeps both ends of a single enormous line", () => {
+  const result = compactStdout(`START${"x".repeat(60_000)}END`);
+  assert.ok(result.stdout.startsWith("START"));
+  assert.ok(result.stdout.endsWith("END"));
+  assert.ok(result.sentChars <= 12_000);
+});
+
+test("omitted-line count reflects positions, not distinct strings", () => {
+  // 900 lines drawn from only 3 distinct strings. Counting a Set of strings
+  // would report nearly every line as omitted.
+  const repetitive = Array.from({ length: 900 }, (_, i) => `repeated variant ${i % 3}`).join("\n");
+  const result = compactStdout(repetitive);
+  assert.equal(result.elidedLines, 900 - 60 - 60);
+});
+
 test("non-Bash and image results are left untouched", () => {
   assert.equal(processPostToolUse({ tool_name: "Read", tool_response: { stdout: noisyOutput() } }, "/tmp/unused"), null);
   assert.equal(processPostToolUse({ tool_name: "Bash", tool_response: { stdout: noisyOutput(), isImage: true } }, "/tmp/unused"), null);

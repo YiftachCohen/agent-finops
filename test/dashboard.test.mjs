@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { get } from "node:http";
 import { startDashboard } from "../src/dashboard.mjs";
 
-function request(url) {
+function request(url, headers = {}) {
   return new Promise((resolve, reject) => {
-    const req = get(url, (response) => {
+    const req = get(url, { headers }, (response) => {
       let body = "";
       response.setEncoding("utf8");
       response.on("data", (chunk) => { body += chunk; });
@@ -38,6 +38,19 @@ test("dashboard serves aggregate metadata on a random loopback port and no other
     assert.ok(!root.body.includes("TOP-SECRET-EXAMPLE"));
     const missing = await request(`${running.url}missing`);
     assert.equal(missing.status, 404);
+  } finally {
+    await new Promise((resolve) => running.server.close(resolve));
+  }
+});
+
+test("dashboard refuses a forged Host header so a public site cannot rebind to it", async () => {
+  const running = await startDashboard(report, { recommendations: [] }, { port: 0 });
+  try {
+    const { port } = new URL(running.url);
+    const rebound = await request(running.url, { Host: `attacker.example:${port}` });
+    assert.equal(rebound.status, 403);
+    assert.ok(!rebound.body.includes("Agent FinOps"));
+    assert.equal((await request(running.url, { Host: `localhost:${port}` })).status, 200);
   } finally {
     await new Promise((resolve) => running.server.close(resolve));
   }

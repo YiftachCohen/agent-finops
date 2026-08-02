@@ -22,5 +22,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - run: npm run public-audit
+      # release-check runs the tests, privacy audit, public audit, and an
+      # offline package-content check.
       - run: npm run release-check

@@ -24,6 +24,11 @@ function addRecord(target, record, cost) {
   else target.unpricedTokens += record.usage.input + record.usage.cacheCreate + record.usage.cacheRead + record.usage.output;
 }
 
+// Splitting a turn across the tools that preceded it yields fractional token
+// counts. They are kept exact so tool rows still sum to the unsplit total, and
+// rounded only where they are rendered.
+const tokenFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+
 function attributedRecord(record, divisor) {
   if (divisor <= 1) return record;
   return {
@@ -59,7 +64,7 @@ function keepLast(records) {
 }
 
 /** Aggregate a bounded list of metadata-only accounting records. */
-export function buildReport(rawRecords, { sinceMs = null, sessionLimit = 8, toolLimit = 20 } = {}) {
+export function buildReport(rawRecords, { sinceMs = null, sessionLimit = 8, toolLimit = 20, projectLimit = 8 } = {}) {
   const dated = rawRecords.filter((record) => {
     if (!sinceMs) return true;
     const timestamp = Date.parse(record.timestamp || "");
@@ -103,7 +108,7 @@ export function buildReport(rawRecords, { sinceMs = null, sessionLimit = 8, tool
   const projects = Object.entries(byProject)
     .map(([id, value]) => ({ id, ...value }))
     .sort((a, b) => b.usd - a.usd || b.usage.total - a.usage.total)
-    .slice(0, 8);
+    .slice(0, projectLimit);
   const tools = Object.entries(byTool)
     .map(([name, value]) => ({ name, ...value }))
     .sort((a, b) => b.usd - a.usd || b.usage.total - a.usage.total || b.calls - a.calls)
@@ -214,7 +219,7 @@ export function humanComparison(comparison) {
 
 export function humanSessions(sessions) {
   if (!sessions.length) return "No sessions found in this period.";
-  const number = new Intl.NumberFormat("en-US");
+  const number = tokenFormat;
   const lines = ["Sessions (anonymous local IDs):"];
   for (const session of sessions) lines.push(`  ${session.id}  ${formatUsd(session.usd)}  ${number.format(session.usage.total)} tokens  ${session.requests} turns`);
   lines.push("", "Use `agent-finops session ID` for one session or `compare-sessions A B` for a direct comparison.");
@@ -224,7 +229,7 @@ export function humanSessions(sessions) {
 export function humanTools(tools, { onlyMcp = false } = {}) {
   const rows = onlyMcp ? tools.filter((tool) => tool.name.startsWith("mcp__")) : tools;
   if (!rows.length) return onlyMcp ? "No MCP tool calls found in this period." : "No tool calls found in this period.";
-  const number = new Intl.NumberFormat("en-US");
+  const number = tokenFormat;
   const label = onlyMcp ? "MCP" : "Tool/MCP";
   const lines = [`${label} follow-on attribution (local estimate):`];
   for (const tool of rows) lines.push(`  ${tool.name.padEnd(34)} ${formatUsd(tool.usd).padStart(10)}  ${number.format(tool.usage.total)} tokens  ${tool.calls} call(s)  ${tool.followOnRequests} follow-on turn(s)`);
@@ -233,7 +238,7 @@ export function humanTools(tools, { onlyMcp = false } = {}) {
 }
 
 export function humanReport(report) {
-  const number = new Intl.NumberFormat("en-US");
+  const number = tokenFormat;
   const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
   const percent = (value) => (value == null ? "n/a" : `${(value * 100).toFixed(1)}%`);
   const u = report.total.usage;

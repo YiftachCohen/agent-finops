@@ -1,7 +1,7 @@
 import { createReadStream, readdirSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { relative, join, sep } from "node:path";
-import { fingerprint, recordFromClaudeRawLine, toolNamesFromClaudeRawLine } from "./records.mjs";
+import { fingerprint, isToolResultLine, recordFromClaudeRawLine, toolNamesFromClaudeRawLine } from "./records.mjs";
 
 /** Discover local Claude Code JSONL files without opening their content. */
 export function findClaudeJsonl(root) {
@@ -43,7 +43,7 @@ export async function readClaudeRecords(file) {
     for await (const raw of lines) {
       if (!raw.trim()) continue;
       const toolNames = toolNamesFromClaudeRawLine(raw);
-      const record = recordFromClaudeRawLine(raw, file);
+      const record = recordFromClaudeRawLine(raw, file, toolNames);
       if (record?.parseError) parseErrors++;
       else if (record) {
         // A tool result is represented by a user-side event between assistant
@@ -56,6 +56,11 @@ export async function readClaudeRecords(file) {
         // Some tool-use events have no billing payload of their own. They still
         // describe the cohort whose following request we can measure.
         pendingTools = toolNames;
+      } else if (!isToolResultLine(raw)) {
+        // A fresh human turn ends the cohort. Without this the tool called
+        // before the prompt would be charged for every later turn in the
+        // session, systematically inflating tool and MCP cost.
+        pendingTools = [];
       }
     }
   } catch {
