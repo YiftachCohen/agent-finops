@@ -23,6 +23,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+      # Both audits are ripgrep-based and fail loudly when it is missing rather
+      # than passing vacuously; the runner image does not ship it.
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       # release-check runs the tests, privacy audit, public audit, and an
       # offline package-content check.
       - run: npm run release-check

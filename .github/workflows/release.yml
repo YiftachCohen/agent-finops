@@ -31,6 +31,10 @@ jobs:
             echo "Tag $RELEASE_TAG does not match package.json version $VERSION" >&2
             exit 1
           }
+      # Both audits are ripgrep-based and fail loudly when it is missing rather
+      # than passing vacuously; the runner image does not ship it.
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: npm run release-check
       - run: npm run bundle
       - name: Create GitHub release
