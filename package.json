@@ -10,6 +10,7 @@
   "scripts": {
     "report": "node src/cli.mjs report",
     "test": "node --test",
+    "check": "for file in src/*.mjs test/*.mjs; do node --check \"$file\" || exit 1; done",
     "audit": "bash scripts/privacy-audit.sh",
     "public-audit": "bash scripts/public-audit.sh",
     "release-check": "bash scripts/release-check.sh",

@@ -1,15 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { boundaryToMs, durationToMs, listLimit, parseArgs, sinceToMs, timeWindow } from "../src/cli.mjs";
+import { renderDashboard } from "../src/dashboard.mjs";
+import { indexedRecords, loadIndex } from "../src/index.mjs";
+import { buildReport } from "../src/report.mjs";
 
 const run = promisify(execFile);
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "cli.mjs");
 const SECRET = "TOP-SECRET-EXAMPLE";
+// A stand-in for the random per-install salt, so output can be searched for it.
+const SALT = "SALT-MUST-NEVER-LEAVE-THE-INDEX-FILE";
 
 function runWithStdin(args, input, env = {}) {
   return new Promise((resolve, reject) => {
@@ -45,6 +51,7 @@ test("CLI produces a JSON report without prompt content", async () => {
     const result = JSON.parse(stdout);
     assert.equal(result.total.usage.total, 15);
     assert.equal(result.index.scanStats.filesSeen, 1);
+    assert.deepEqual(Object.keys(result.diagnostics).sort(), ["duplicatesDropped", "missingIds"], "no per-turn record list in shared JSON");
     // This JSON is the artifact people share; an absolute path would carry the
     // local username. `doctor` is where paths are printed.
     assert.ok(!stdout.includes(root), "no log-dir path");
@@ -131,6 +138,51 @@ test("CLI reports MCP follow-on cohorts and directly compares anonymous sessions
   }
 });
 
+test("the project command reports one project by its local id and refuses an unknown one", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-finops-project-cli-"));
+  const labelsFile = join(root, "labels.json");
+  try {
+    mkdirSync(join(root, "alpha"));
+    mkdirSync(join(root, "beta"));
+    const index = join(root, "index.json");
+    const turn = (id, output) => JSON.stringify({ type: "assistant", requestId: id, timestamp: "2026-08-01T10:00:00Z", message: { id, model: "claude-sonnet-4-6", content: SECRET, usage: { input_tokens: 1000, cache_read_input_tokens: 2000, output_tokens: output } } });
+    writeFileSync(join(root, "alpha", "session.jsonl"), [turn("r1", 40_000), turn("r2", 40_000)].join("\n"));
+    writeFileSync(join(root, "beta", "session.jsonl"), turn("r3", 1));
+    const env = { ...process.env, AGENT_FINOPS_LABELS: labelsFile };
+    const shared = ["--log-dir", root, "--index", index];
+    await run("node", [CLI, "scan", ...shared], { env });
+
+    const list = JSON.parse((await run("node", [CLI, "projects", "--json", ...shared], { env })).stdout);
+    assert.equal(list.length, 2);
+    const [top] = list;
+    await run("node", [CLI, "label", top.id, "Payments API"], { env });
+
+    const detail = await run("node", [CLI, "project", top.id, ...shared], { env });
+    // The label heads the report; the report body stays the shareable artifact.
+    assert.match(detail.stdout, /^Project: Payments API \([0-9a-f]{12}\)\n/);
+    assert.match(detail.stdout, /local-only estimate/);
+    assert.match(detail.stdout, /Cost by class: /);
+    assert.ok(!detail.stdout.includes(SECRET));
+
+    const scoped = JSON.parse((await run("node", [CLI, "project", top.id, "--json", ...shared], { env })).stdout);
+    assert.equal(scoped.total.requests, 2, "only this project's turns are counted");
+    assert.equal(scoped.topProjects.length, 1);
+    assert.equal(scoped.topProjects[0].id, top.id);
+    assert.ok(Math.abs(scoped.total.usd - top.usd) < 1e-9);
+    assert.ok(!JSON.stringify(scoped).includes(SECRET));
+
+    // An id nobody used is an error, not an empty report that reads as $0 spent.
+    const missing = await runWithStdin(["project", "ffffffffffff", ...shared], "", { AGENT_FINOPS_LABELS: labelsFile });
+    assert.equal(missing.code, 1);
+    assert.match(missing.stderr, /No usage records found for project ffffffffffff/);
+    const bare = await runWithStdin(["project", ...shared], "", { AGENT_FINOPS_LABELS: labelsFile });
+    assert.equal(bare.code, 1);
+    assert.match(bare.stderr, /project requires a project ID/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("hook command reads stdin and returns a valid PostToolUse replacement", async () => {
   const filterDir = mkdtempSync(join(tmpdir(), "agent-finops-hook-cli-"));
   try {
@@ -147,5 +199,272 @@ test("hook command reads stdin and returns a valid PostToolUse replacement", asy
     assert.ok(output.hookSpecificOutput.updatedToolOutput.stdout.length < event.tool_response.stdout.length);
   } finally {
     rmSync(filterDir, { recursive: true, force: true });
+  }
+});
+
+test("hotspots reads the filter ledger and the trend, and survives having neither", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-finops-extras-"));
+  const filterDir = mkdtempSync(join(tmpdir(), "agent-finops-extras-filter-"));
+  try {
+    mkdirSync(join(root, "project"));
+    const index = join(root, "index.json");
+    // Relative to now, because the trend windows are: three days ago is inside
+    // the current 7-day window and ten days ago is inside the previous one.
+    const daysAgo = (offset) => new Date(Date.now() - offset * 86_400_000).toISOString();
+    const turn = (id, timestamp, output, content) => JSON.stringify({
+      type: "assistant",
+      requestId: id,
+      timestamp,
+      message: { id, model: "claude-sonnet-4-6", content: content ?? SECRET, usage: { input_tokens: 10, output_tokens: output } },
+    });
+    writeFileSync(join(root, "project", "session.jsonl"), [
+      turn("r1", daysAgo(3), 5, [{ type: "tool_use", id: "call-1", name: "Bash", input: { command: SECRET } }]),
+      JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: SECRET }] } }),
+      // Sonnet 4.6 bills output at $15/M, so this follow-on turn is $45 and it is
+      // attributed to the single Bash call that preceded it.
+      turn("r2", daysAgo(3), 3e6),
+      turn("r3", daysAgo(10), 1e6),
+    ].join("\n"));
+
+    const shared = ["--log-dir", root, "--index", index, "--fresh"];
+    // No ledger and no artifacts: the recommendation still lands, with nothing
+    // measured attached to it.
+    const bare = JSON.parse((await run("node", [CLI, "hotspots", "--json", ...shared], { env: { ...process.env, AGENT_FINOPS_FILTER_DIR: join(filterDir, "absent") } })).stdout);
+    const bareKinds = bare.analysis.recommendations.map((item) => item.kind);
+    assert.ok(bareKinds.includes("bash-output-filter"), "an expensive Bash cohort should point at the filter");
+    assert.ok(bareKinds.includes("spend-acceleration"), "a window up 200% on the previous one should be called out");
+    const bareBash = bare.analysis.recommendations.find((item) => item.kind === "bash-output-filter");
+    assert.ok(!bareBash.evidence.includes("already removed"), "nothing was measured, so nothing is claimed");
+    const acceleration = bare.analysis.recommendations.find((item) => item.kind === "spend-acceleration");
+    assert.match(acceleration.evidence, /largest model-level change is claude-sonnet-4-6/);
+
+    // The same run with a ledger the hook has actually written quotes it.
+    writeFileSync(join(filterDir, "history.jsonl"), [
+      JSON.stringify({ timestamp: daysAgo(2), session: "aaaa", project: "bbbb", artifactId: "x", rawChars: 500_000, sentChars: 100_000, elidedLines: 400 }),
+      JSON.stringify({ timestamp: daysAgo(1), session: "aaaa", project: "bbbb", artifactId: "y", rawChars: 300_000, sentChars: 100_000, elidedLines: 200 }),
+    ].join("\n"));
+    const measured = JSON.parse((await run("node", [CLI, "hotspots", "--json", ...shared], { env: { ...process.env, AGENT_FINOPS_FILTER_DIR: filterDir } })).stdout);
+    const measuredBash = measured.analysis.recommendations.find((item) => item.kind === "bash-output-filter");
+    assert.match(measuredBash.evidence, /already removed ~150,000 input tokens across 2 filtered result\(s\)/);
+
+    // Neither extra may put prompt content or a path into the shared artifact.
+    for (const payload of [JSON.stringify(bare), JSON.stringify(measured)]) {
+      assert.ok(!payload.includes(SECRET), "hotspots leaked prompt content");
+      assert.ok(!payload.includes(root), "hotspots leaked a log path");
+      assert.ok(!payload.includes(filterDir), "hotspots leaked the filter path");
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(filterDir, { recursive: true, force: true });
+  }
+});
+
+test("duration and limit flags are parsed strictly, and a flag without a value fails", () => {
+  // A flag whose value is missing used to read `undefined`, which silently
+  // turned `--since` into "no time filter at all" — the opposite of the ask.
+  assert.throws(() => parseArgs(["report", "--since"]), /--since requires a value\./);
+  assert.throws(() => parseArgs(["prune", "--older-than"]), /--older-than requires a value\./);
+  assert.throws(() => parseArgs(["report", "--index"]), /--index requires a value\./);
+  assert.equal(parseArgs(["report", "--since", "7d"]).since, "7d");
+  // A value that looks like a flag is still consumed as the value; the parser
+  // must not skip it and leave the flag unset.
+  assert.equal(parseArgs(["report", "--since", "--json"]).since, "--json");
+
+  assert.equal(sinceToMs(null), null);
+  const day = sinceToMs("1d");
+  assert.ok(Math.abs(Date.now() - day - 86_400_000) < 5_000);
+  assert.ok(Math.abs(Date.now() - sinceToMs("2w") - 1_209_600_000) < 5_000);
+  for (const bad of ["7", "d", "7 d", "-1d", "7m", "7dd", "1e3d", "24H"]) {
+    assert.throws(() => sinceToMs(bad), /Invalid --since value/, bad);
+  }
+
+  assert.equal(durationToMs("24h", "--older-than"), 3_600_000 * 24);
+  assert.throws(() => durationToMs(null, "--older-than"), /--older-than requires a duration/);
+  assert.throws(() => durationToMs("forever", "--older-than"), /Invalid --older-than value/);
+
+  assert.equal(listLimit(20), 20);
+  for (const bad of [0, -1, 1.5, 10_001, Number.NaN, Infinity, "20"]) {
+    assert.throws(() => listLimit(bad), /--limit must be an integer between 1 and 10000\./, String(bad));
+  }
+});
+
+test("an absolute window is parsed strictly and never silently overrides --since", () => {
+  assert.equal(parseArgs(["report", "--from", "2026-07-01"]).from, "2026-07-01");
+  assert.equal(parseArgs(["report", "--to", "2026-08-01"]).to, "2026-08-01");
+  assert.throws(() => parseArgs(["report", "--from"]), /--from requires a value\./);
+  assert.throws(() => parseArgs(["report", "--to"]), /--to requires a value\./);
+
+  // A bare date is UTC midnight: day buckets are UTC everywhere else, and a
+  // local-midnight window would be shifted by hours at both ends.
+  assert.equal(boundaryToMs("2026-07-01", "--from"), Date.parse("2026-07-01T00:00:00Z"));
+  assert.equal(boundaryToMs("2026-07-01T09:30:00Z", "--from"), Date.parse("2026-07-01T09:30:00Z"));
+  assert.equal(boundaryToMs("2026-07-01T09:30:00+02:00", "--from"), Date.parse("2026-07-01T07:30:00Z"));
+  assert.equal(boundaryToMs(null, "--from"), null);
+  for (const bad of ["7d", "2026-7-1", "2026-07-01 09:30", "July 1", "2026", "now", "2026-07-01T09", "2026-13-01", "2026-02-30"]) {
+    assert.throws(() => boundaryToMs(bad, "--from"), /Invalid --from value/, bad);
+  }
+
+  // Precedence would hand back a window nobody asked for; this pair exists
+  // precisely so the requested window is unambiguous.
+  assert.throws(() => timeWindow({ since: "7d", from: "2026-07-01" }), /use one or the other/);
+  assert.throws(() => timeWindow({ since: "7d", to: "2026-08-01" }), /use one or the other/);
+  assert.deepEqual(timeWindow({ from: "2026-07-01", to: "2026-08-01" }), { sinceMs: Date.parse("2026-07-01T00:00:00Z"), untilMs: Date.parse("2026-08-01T00:00:00Z") });
+  assert.deepEqual(timeWindow({ to: "2026-08-01" }), { sinceMs: null, untilMs: Date.parse("2026-08-01T00:00:00Z") });
+  assert.deepEqual(timeWindow({}), { sinceMs: null, untilMs: null });
+  assert.equal(timeWindow({ since: "1d" }).untilMs, null);
+});
+
+test("--from/--to filter an exact calendar month, and a tag remembers the window it took", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-finops-window-"));
+  try {
+    mkdirSync(join(root, "project"));
+    const index = join(root, "index.json");
+    const turn = (id, timestamp, output) => JSON.stringify({ type: "assistant", requestId: id, timestamp, message: { id, model: "claude-sonnet-4-6", content: SECRET, usage: { input_tokens: 10, output_tokens: output } } });
+    writeFileSync(join(root, "project", "session.jsonl"), [
+      turn("june", "2026-06-30T23:59:59Z", 100),
+      turn("july-open", "2026-07-01T00:00:00Z", 1),
+      turn("july-mid", "2026-07-20T12:00:00Z", 2),
+      turn("august", "2026-08-01T00:00:00Z", 400),
+    ].join("\n"));
+    const shared = ["--log-dir", root, "--index", index];
+    const july = JSON.parse((await run("node", [CLI, "report", "--json", "--from", "2026-07-01", "--to", "2026-08-01", ...shared, "--fresh"])).stdout);
+    assert.equal(july.total.requests, 2, "the turn at 2026-07-01T00:00:00Z is in, the one at 2026-08-01T00:00:00Z is out");
+    assert.equal(july.total.usage.output, 3);
+    assert.deepEqual(Object.keys(july.byDay), ["2026-07-01", "2026-07-20"]);
+    assert.equal(july.scope.untilMs, Date.parse("2026-08-01T00:00:00Z"));
+
+    // A tag stores its resolved window, so `compare` can state what each side
+    // covers instead of leaving the reader to assume the two windows matched.
+    await run("node", [CLI, "tag", "july", "--from", "2026-07-01", "--to", "2026-08-01", ...shared]);
+    await run("node", [CLI, "tag", "august", "--from", "2026-08-01", "--to", "2026-09-01", ...shared]);
+    const comparison = (await run("node", [CLI, "compare", "july", "august", "--index", index])).stdout;
+    assert.match(comparison, /Windows \(start inclusive, end exclusive\):/);
+    assert.match(comparison, /july\s+2026-07-01T00:00:00\.000Z → 2026-08-01T00:00:00\.000Z/);
+    assert.match(comparison, /august\s+2026-08-01T00:00:00\.000Z → 2026-09-01T00:00:00\.000Z/);
+    assert.ok(!comparison.includes(SECRET));
+
+    const conflict = await runWithStdin(["report", "--since", "7d", "--from", "2026-07-01", ...shared], "");
+    assert.equal(conflict.code, 1);
+    assert.match(conflict.stderr, /use one or the other/);
+    const malformed = await runWithStdin(["report", "--from", "last July", ...shared], "");
+    assert.equal(malformed.code, 1);
+    assert.match(malformed.stderr, /Invalid --from value/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a deleted log file keeps its spend, and prune-index is the only way to drop it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-finops-retired-cli-"));
+  try {
+    mkdirSync(join(root, "project"));
+    const index = join(root, "index.json");
+    const kept = join(root, "project", "kept.jsonl");
+    const deleted = join(root, "project", "deleted.jsonl");
+    const line = (id, output, day = "01") => `{"type":"assistant","requestId":"${id}","timestamp":"2026-08-${day}T10:00:00Z","message":{"id":"${id}","model":"claude-sonnet-4-6","content":"${SECRET}","usage":{"input_tokens":10,"output_tokens":${output}}}}`;
+    writeFileSync(kept, line("r1", 5));
+    writeFileSync(deleted, line("r2", 25));
+    const before = JSON.parse((await run("node", [CLI, "report", "--json", "--log-dir", root, "--index", index, "--fresh"])).stdout);
+    assert.equal(before.topSessions.length, 2);
+
+    // Claude Code prunes its own transcripts. The index is a durable store, not
+    // a cache of what is currently on disk, so the estimate must not move.
+    rmSync(deleted);
+    const after = JSON.parse((await run("node", [CLI, "report", "--json", "--log-dir", root, "--index", index, "--fresh"])).stdout);
+    assert.equal(after.total.usd, before.total.usd);
+    assert.equal(after.total.requests, before.total.requests);
+    assert.deepEqual(after.topSessions.map((session) => session.id).sort(), before.topSessions.map((session) => session.id).sort());
+    assert.ok(!JSON.stringify(after).includes(SECRET));
+
+    // Retired history is bounded only on request. A cutoff that predates the
+    // records removes nothing; one that postdates them removes exactly them.
+    const untouched = JSON.parse((await run("node", [CLI, "prune-index", "--older-than", "52w", "--json", "--index", index])).stdout);
+    assert.equal(untouched.removedRecords, 0);
+    assert.equal(untouched.remainingRecords, 1);
+    const pruned = JSON.parse((await run("node", [CLI, "prune-index", "--older-than", "24h", "--json", "--index", index])).stdout);
+    assert.equal(pruned.removedRecords, 1);
+    assert.equal(pruned.removedSources, 1);
+    const dropped = JSON.parse((await run("node", [CLI, "report", "--json", "--log-dir", root, "--index", index])).stdout);
+    assert.equal(dropped.topSessions.length, 1);
+    assert.ok(dropped.total.usd < before.total.usd);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the per-install salt never leaves the index file", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-finops-salt-cli-"));
+  const labels = join(root, "labels.json");
+  try {
+    mkdirSync(join(root, "project"));
+    const index = join(root, "index.json");
+    const log = join(root, "project", "session.jsonl");
+    writeFileSync(log, [
+      JSON.stringify({ type: "assistant", requestId: "r1", timestamp: "2026-08-01T10:00:00Z", message: { id: "m1", model: "claude-sonnet-4-6", content: [{ type: "tool_use", id: "call-1", name: "mcp__issues__search", input: { query: SECRET } }], usage: { input_tokens: 2, output_tokens: 3 } } }),
+      JSON.stringify({ type: "assistant", requestId: "r2", timestamp: "2026-08-01T10:01:00Z", message: { id: "m2", model: "claude-sonnet-4-6", content: SECRET, usage: { input_tokens: 100, output_tokens: 20 } } }),
+    ].join("\n"));
+    // `hotspots` now consults the filter ledger, so it is pointed inside the
+    // fixture: a test must not read the developer's own local state.
+    const env = { AGENT_FINOPS_LABELS: labels, AGENT_FINOPS_FILTER_DIR: join(root, "filter") };
+    await run("node", [CLI, "scan", "--log-dir", root, "--index", index], { env: { ...process.env, ...env } });
+
+    // A known salt in place of the generated one, so every command's output can
+    // be searched for it directly.
+    const stored = JSON.parse(readFileSync(index, "utf8"));
+    assert.match(stored.salt, /^[a-f0-9]{64}$/, "a generated salt is 32 random bytes");
+    stored.salt = SALT;
+    writeFileSync(index, JSON.stringify(stored));
+
+    const sessions = JSON.parse((await run("node", [CLI, "sessions", "--json", "--index", index])).stdout);
+    const projectRows = JSON.parse((await run("node", [CLI, "projects", "--json", "--index", index])).stdout);
+    const commands = [
+      ["report", "--json"], ["report"],
+      ["hotspots", "--json"], ["hotspots"],
+      ["tools", "--json"], ["mcp", "--json"],
+      ["sessions", "--json"], ["projects", "--json"], ["projects"],
+      ["trend", "--json"], ["trend"],
+      ["session", sessions[0].id, "--json"],
+      ["project", projectRows[0].id, "--json"], ["project", projectRows[0].id],
+      ["scan", "--json"], ["scan"],
+      ["tag", "windowed", "--json"], ["compare", "windowed", "windowed"],
+      ["doctor"],
+    ];
+    for (const command of commands) {
+      const { stdout, stderr } = await run("node", [CLI, ...command, "--log-dir", root, "--index", index], { env: { ...process.env, ...env } });
+      assert.ok(!stdout.includes(SALT), `${command[0]} stdout leaked the salt`);
+      assert.ok(!stderr.includes(SALT), `${command[0]} stderr leaked the salt`);
+      assert.ok(!stdout.includes(SECRET), `${command[0]} stdout leaked prompt content`);
+    }
+    // The tag payload is stored in the same file as the salt; it must not copy it.
+    assert.ok(!JSON.stringify(JSON.parse(readFileSync(index, "utf8")).tags).includes(SALT));
+
+    // `dashboard` serves rather than prints, so its page is rendered from the
+    // same report object the JSON commands emit and checked directly. It is the
+    // one view that also carries local project labels, so it renders with them.
+    const dashboardRecords = indexedRecords(loadIndex(index));
+    const page = renderDashboard(
+      buildReport(dashboardRecords, { sessionLimit: 12, toolLimit: 12, projectLimit: 12 }),
+      { recommendations: [] },
+      Object.fromEntries(dashboardRecords.filter((record) => record.project).map((record) => [record.project, "Payments API"])),
+    );
+    assert.ok(!page.includes(SALT), "the dashboard page leaked the salt");
+    assert.ok(!page.includes(SECRET), "the dashboard page leaked prompt content");
+    assert.ok(page.includes("Payments API"), "a labelled project should reach the page");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the CLI still runs when it is invoked through an installed symlink", async () => {
+  // `scripts/install-local.sh` puts a symlink on PATH. The entry-point guard
+  // that keeps the helpers importable must not turn that into a silent no-op.
+  const root = mkdtempSync(join(tmpdir(), "agent-finops-link-"));
+  try {
+    const link = join(root, "agent-finops");
+    symlinkSync(CLI, link);
+    const { stdout } = await run("node", [link, "--help"]);
+    assert.match(stdout, /^Usage:/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

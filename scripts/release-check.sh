@@ -6,6 +6,8 @@ TASK_CACHE=$(mktemp -d "${TMPDIR:-/tmp}/agent-finops-npm-cache.XXXXXX")
 trap 'rm -rf "$TASK_CACHE"' EXIT
 
 cd "$ROOT"
+# Syntax first: a file no test imports would otherwise ship a parse error green.
+npm run check
 npm test
 npm run audit
 npm run public-audit

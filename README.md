@@ -11,16 +11,27 @@ The default data boundary is deliberately narrow:
   log-file path needed to create a local session fingerprint.
 - Never retains: prompts, responses, reasoning, terminal output, tool arguments,
   instructions, working-directory text, or source code.
-- Writes: one private local metadata index, created only by `scan`, `report
-  --fresh`, or `tag --fresh`. It contains hashed project/session/request IDs,
-  timestamps, model IDs, and token counters—not paths or transcript content.
+- Writes: one private local metadata index. `scan` and any `--fresh` command
+  rewrite it on demand, and any reporting command rewrites it on its own once
+  the index is more than an hour old, so a spend figure is never served from a
+  stale snapshot that reads like "no usage". Every write has the same
+  metadata-only content: hashed project/session/request IDs, timestamps, model
+  IDs, and token counters—not paths or transcript content.
+- Keeps: the index is a durable store, not a cache of what is currently on
+  disk. Claude Code deletes its own old transcripts; the metadata records for a
+  log file that is gone are retired inside the index and keep counting, so
+  history does not shrink behind you. Bound that history with
+  `agent-finops prune-index --older-than 90d`, which is the only thing that
+  deletes it.
 
 This is a cost-management tool, not an invoice. Its rate table is local and
 versioned in source. Bedrock region, cross-region, negotiated, and TTL-specific
 pricing can differ from the estimate. Specifically:
 
-- Cache writes are priced at the 5-minute TTL (1.25x input). A 1-hour TTL costs
-  2x, and the JSONL does not record which TTL a turn used.
+- Cache writes are priced by TTL: 1.25x input for a 5-minute write, 2x for a
+  1-hour write. Claude Code records the split, so each turn is priced with the
+  TTL it actually used. A turn logged without that breakdown is charged at the
+  5-minute rate, which understates rather than inflates it.
 - Fast mode bills at a premium but is not distinguishable in the log, so a
   fast-mode turn is estimated at the standard rate for its model.
 - Introductory pricing is applied by the timestamp on each turn, so a report
@@ -47,6 +58,7 @@ npm test
 npm run audit
 agent-finops scan
 agent-finops report --since 7d
+agent-finops report --from 2026-07-01 --to 2026-08-01
 agent-finops dashboard --since 30d
 agent-finops trend --days 7
 agent-finops hotspots --since 24h
@@ -55,9 +67,11 @@ agent-finops mcp --since 7d
 agent-finops sessions --since 7d --limit 20
 agent-finops compare-sessions SESSION_A SESSION_B --since 7d
 agent-finops projects --limit 20
+agent-finops project d78a771feca2 --since 7d
 agent-finops label d78a771feca2 "Billing app"
 agent-finops tag baseline-24h --since 24h --fresh
 agent-finops compare baseline-24h boost-24h
+agent-finops prune-index --older-than 90d
 agent-finops hook-config
 agent-finops filter-report --since 7d
 agent-finops report --json > /private/tmp/agent-finops.json
@@ -67,9 +81,29 @@ agent-finops doctor
 By default it reads `~/.claude/projects`. Use `--log-dir` or
 `AGENT_FINOPS_LOG_DIR` for a different Claude configuration directory.
 
-`--json` output contains no filesystem paths, so a report can be shared without
-disclosing a local username. Run `doctor` when you need to see which index and
-log directory are in use.
+`--json` output contains no filesystem paths. Session and project ids are
+salted per install, so a shared report neither carries a local username nor lets
+a reader confirm a guessed one — and ids from two machines, or from the same
+machine before and after a reinstall, cannot be lined up with each other. Run
+`doctor` when you need to see which index and log directory are in use.
+
+### Time windows
+
+Every command that accepts `--since` also accepts `--from` and `--to`:
+
+- `--since 7d` is relative to now (`24h`, `7d`, `2w`).
+- `--from` and `--to` are absolute. Each takes a date such as `2026-07-01`,
+  read as UTC midnight because day buckets are UTC, or a full ISO-8601
+  timestamp such as `2026-07-01T09:30:00Z`.
+- The window is `[from, to)`: the start is included and the end is excluded, so
+  `--from 2026-07-01 --to 2026-08-01` is exactly July. Either bound works on
+  its own — `--to` alone means everything before it.
+- `--since` and `--from`/`--to` cannot be combined; that is an error, not a
+  silent precedence rule.
+- `trend` uses `--days` instead and is unaffected.
+
+Use the absolute form for `tag`/`compare`: a comparison is only meaningful over
+matched windows, and `compare` prints the window each snapshot was taken over.
 
 ### Deploy on a work laptop
 
@@ -97,8 +131,18 @@ resulting `package` directory, then run `./scripts/install-local.sh`.
 ## Reports
 
 Run `scan` to incrementally update the local index. It reuses unchanged log
-files and re-reads only files that Claude Code changed. `report --fresh` scans
-first; a plain `report` deliberately uses the last local scan.
+files and re-reads only files that Claude Code changed. Reporting commands also
+scan on their own once the index is over an hour old, which rewrites it with the
+same metadata-only content; inside that hour they read the last scan as it is.
+`--fresh` forces that scan now, regardless of the index's age.
+
+A log file that has disappeared since the last scan is *retired*, not forgotten:
+its metadata records stay in the index and stay in every report, and `scan` says
+how many sources it retired. Claude Code prunes its own transcripts, so without
+this a report would quietly lose past spend. `prune-index --older-than 90d` is
+the only thing that deletes retired records; it never touches live log files,
+and a retired record with no usable timestamp counts as older than any cutoff
+because no window can hold it.
 
 `report` includes:
 
@@ -123,10 +167,13 @@ header is not loopback, so a public site cannot point its own hostname at
 `127.0.0.1` and read the page as same-origin. Use `--port 0` to choose a random
 local port, or `--fresh` to scan before serving.
 
-`trend --days 7` compares the most recent seven calendar days with the seven
-before them and prints daily history. `projects` groups the same cost by an
-anonymous local project id. If you want readable names, add an explicit local
-label with `label`; labels store only the id and your chosen name, never a path.
+`trend --days 7` compares the most recent seven *complete* UTC days with the
+seven before them and prints daily history. Today is deliberately outside both
+windows — a part-day against whole days reads as a decline every morning — and
+is printed separately as a partial figure. `projects` groups the same cost by an
+anonymous local project id, and `project ID` reports one of them on its own. If
+you want readable names, add an explicit local label with `label`; labels store
+only the id and your chosen name, never a path.
 
 `hotspots` turns those metrics into evidence-backed next experiments. `tag` and
 `compare` create private snapshots so changes such as Boost, a custom terminal
@@ -193,8 +240,18 @@ After a session using the hook:
 Measure a matching baseline and treatment window with `tag`/`compare` before
 declaring that output reduction helped overall cost or task success.
 
-Project/session identifiers are stable SHA-256 prefixes derived locally. They
-are useful for grouping cost without placing a path in normal report output.
+Project/session identifiers are SHA-256 prefixes derived locally from the log
+path and project directory name, salted with a random 32-byte value generated on
+first use and kept inside the `0600` index. They are stable on one install and
+deliberately not portable: the same repository on another machine, or on this one
+after the index is deleted, gets a different id.
+
+That salt arrived in this release, so ids from an earlier version have all
+changed. Project labels are keyed by the old ids and no longer match; `scan`
+prints a notice when it sees a labels file that matches nothing. Nothing is
+deleted — re-run `agent-finops projects` and re-apply the names with
+`agent-finops label`. Tag snapshots are aggregates without record ids and are
+unaffected.
 
 ## Privacy audit
 
