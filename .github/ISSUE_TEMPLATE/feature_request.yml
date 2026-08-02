@@ -1,0 +1,17 @@
+name: Feature request
+description: Propose a cost-analysis or privacy-preserving workflow improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior and privacy impact
+      description: State exactly what data would be read, retained, displayed, or sent (if any).
+    validations:
+      required: true

@@ -1,0 +1,34 @@
+name: Prepare GitHub release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to create, for example v0.4.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm run release-check
+      - run: npm run bundle
+      - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag }}
+        run: test "v$(node -p \"require('./package.json').version\")" = "$RELEASE_TAG"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.tag }}
+        run: gh release create "$RELEASE_TAG" dist/agent-finops-*.tgz --generate-notes

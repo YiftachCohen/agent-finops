@@ -1,0 +1,34 @@
+{
+  "name": "agent-finops",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Private, local-only token and cost reporting for coding agents",
+  "type": "module",
+  "bin": {
+    "agent-finops": "src/cli.mjs"
+  },
+  "scripts": {
+    "report": "node src/cli.mjs report",
+    "test": "node --test",
+    "audit": "bash scripts/privacy-audit.sh",
+    "public-audit": "bash scripts/public-audit.sh",
+    "release-check": "bash scripts/release-check.sh",
+    "bundle": "bash scripts/bundle.sh"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {},
+  "files": [
+    "README.md",
+    "package.json",
+    "src",
+    "scripts/install-local.sh",
+    "scripts/uninstall-local.sh",
+    "scripts/privacy-audit.sh",
+    "scripts/public-audit.sh",
+    "scripts/release-check.sh",
+    "scripts/bundle.sh",
+    "SECURITY.md"
+  ]
+}

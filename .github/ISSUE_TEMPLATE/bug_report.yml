@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible problem without attaching logs or private data.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste Claude transcripts, prompts, tool results, local indexes, AWS credentials, or other private data. Use synthetic examples.
+  - type: input
+    id: version
+    attributes:
+      label: agent-finops version
+      placeholder: 0.4.0
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Use a minimal synthetic reproduction.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and sanitized output
+      description: Remove paths, ids, transcripts, credentials, and private usage data.
+      render: shell
