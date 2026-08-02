@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1b1b1a">
+  <title>agent finops / mark</title>
+  <link rel="icon" href="favicon-ledger.svg" type="image/svg+xml">
+  <style>
+    :root {
+      color-scheme: dark;
+      --ground:#1b1b1a; --ink:#e9e5dc; --muted:#aaa69e;
+      --line:rgba(233,229,220,.22);
+      --serif:"Instrument Serif","Bodoni 72",Didot,"Hoefler Text",Baskerville,Georgia,serif;
+      --mono:"DM Mono",ui-monospace,"SF Mono",Menlo,"DejaVu Sans Mono",Consolas,monospace;
+    }
+    * { box-sizing:border-box; }
+    body {
+      margin:0; background:var(--ground); color:var(--ink);
+      font:13px/1.45 var(--mono);
+      padding:0 clamp(18px,4vw,56px) 96px;
+    }
+    .sheet { max-width:1120px; margin:0 auto; }
+    .micro { margin:0; font-size:9.5px; line-height:1.6; text-transform:uppercase; letter-spacing:.085em; color:var(--muted); }
+    h1 { font-family:var(--serif); font-weight:400; font-size:clamp(54px,8.6vw,104px); line-height:.75; letter-spacing:-.075em; margin:16px 0 14px; }
+    header { padding:clamp(40px,6vw,72px) 0 clamp(24px,3vw,36px); }
+    section { border-top:1px solid var(--line); padding:clamp(26px,3.2vw,40px) 0; }
+    .head { display:flex; align-items:baseline; justify-content:space-between; gap:18px; }
+    .sizes { display:flex; align-items:flex-end; flex-wrap:wrap; gap:clamp(18px,3vw,40px); margin-top:clamp(20px,2.6vw,32px); }
+    .size { display:grid; justify-items:center; gap:10px; }
+    .size img { display:block; }
+    /* Tab strips are not always dark. Both grounds, side by side, at 16px. */
+    .strips { display:flex; margin-top:clamp(18px,2.2vw,26px); border:1px solid var(--line); width:max-content; }
+    .strip { display:flex; align-items:center; gap:9px; padding:9px 14px; font-size:9.5px; letter-spacing:.085em; text-transform:uppercase; }
+    .strip.dark { background:#232322; color:var(--muted); }
+    .strip.light { background:#dedbd4; color:#4a4844; }
+    .strip img { width:16px; height:16px; }
+    .grey { filter:grayscale(1); }
+    p.note { max-width:68ch; color:var(--muted); opacity:.72; margin:14px 0 0; }
+  </style>
+</head>
+<body>
+  <div class="sheet">
+    <header>
+      <p class="micro">agent finops / mark</p>
+      <h1>ledger</h1>
+      <p class="micro">ink on ground / no colour / the register strip frozen</p>
+    </header>
+
+    <section>
+      <div class="head">
+        <p class="micro">sizes</p>
+        <p class="micro">one svg, no raster fallback</p>
+      </div>
+      <div class="sizes">
+        <div class="size"><img src="favicon-ledger.svg" width="16" height="16" alt=""><p class="micro">16</p></div>
+        <div class="size"><img src="favicon-ledger.svg" width="32" height="32" alt=""><p class="micro">32</p></div>
+        <div class="size"><img src="favicon-ledger.svg" width="64" height="64" alt=""><p class="micro">64</p></div>
+        <div class="size"><img src="favicon-ledger.svg" width="180" height="180" alt=""><p class="micro">180</p></div>
+      </div>
+      <p class="note">three readings and the rule that closes them. the mark that says what this tab is when twenty are open.</p>
+    </section>
+
+    <section>
+      <div class="head">
+        <p class="micro">in a tab strip</p>
+        <p class="micro">16px, both grounds</p>
+      </div>
+      <div class="strips">
+        <div class="strip dark"><img src="favicon-ledger.svg" alt="">agent finops</div>
+        <div class="strip light"><img src="favicon-ledger.svg" alt="">agent finops</div>
+      </div>
+      <p class="note">the tile carries its own ground, so the bars hold on a light tab strip as well as a dark one.</p>
+    </section>
+
+    <section>
+      <div class="head">
+        <p class="micro">desaturated</p>
+        <p class="micro">should look identical</p>
+      </div>
+      <div class="sizes grey">
+        <div class="size"><img src="favicon-ledger.svg" width="64" height="64" alt=""><p class="micro">64</p></div>
+        <div class="size"><img src="favicon-ledger.svg" width="180" height="180" alt=""><p class="micro">180</p></div>
+      </div>
+    </section>
+  </div>
+</body>
+</html>

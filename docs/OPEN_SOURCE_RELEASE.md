@@ -31,7 +31,7 @@ wait until each owner-controlled item below is complete.
 - [ ] Run `npm run release-check` locally.
 - [ ] Review the generated package file list; it should contain only source,
   docs, and approved scripts.
-- [ ] Commit, tag `v0.4.0`, and push the tag after CI is green.
+- [ ] Commit, tag `v0.4.1`, and push the tag after CI is green.
 - [ ] Run the manually triggered **Prepare GitHub release** workflow. It checks
   that the tag equals `package.json`, reruns the release gate, bundles the
   tarball, and attaches it to the GitHub release.

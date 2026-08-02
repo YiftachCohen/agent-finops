@@ -1,6 +1,6 @@
 {
   "name": "agent-finops",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Private, local-only token and cost reporting for coding agents",
   "type": "module",
@@ -10,6 +10,7 @@
   "scripts": {
     "report": "node src/cli.mjs report",
     "test": "node --test",
+    "check": "for file in src/*.mjs test/*.mjs; do node --check \"$file\" || exit 1; done",
     "audit": "bash scripts/privacy-audit.sh",
     "public-audit": "bash scripts/public-audit.sh",
     "release-check": "bash scripts/release-check.sh",

@@ -11,6 +11,7 @@ const MAX_CHARS = 12_000;
 const HEAD_LINES = 60;
 const TAIL_LINES = 60;
 const IMPORTANT_LINES = 40;
+const TAIL_CHAR_SHARE = 0.4;
 const SIGNAL_RE = /\b(error|errors|fail|failed|failure|fatal|warning|warn|exception|traceback|assert|expected|actual)\b/i;
 
 function hash(value) {
@@ -36,16 +37,31 @@ function conciseLines(stdout) {
   const head = deduped.slice(0, HEAD_LINES);
   const tail = deduped.slice(-TAIL_LINES);
   const important = deduped.slice(HEAD_LINES, -TAIL_LINES).filter((line) => SIGNAL_RE.test(line)).slice(0, IMPORTANT_LINES);
-  const retained = new Set([...head, ...tail, ...important]);
+  // Count retained positions, not distinct strings: a Set collapses lines that
+  // repeat non-adjacently and overstates how much was dropped.
+  const elided = deduped.length - head.length - tail.length - important.length;
   const middle = important.length ? ["", "[agent-finops: matching diagnostic lines from omitted output]", ...important, ""] : [];
-  return { lines: [...head, `\n[agent-finops: ${deduped.length - retained.size} non-diagnostic lines omitted]\n`, ...middle, ...tail], droppedDuplicates, elided: deduped.length - retained.size };
+  return { lines: [...head, `\n[agent-finops: ${elided} non-diagnostic line(s) omitted]\n`, ...middle, ...tail], droppedDuplicates, elided };
+}
+
+/**
+ * Fit text to a character budget by keeping both ends. Truncating only the end
+ * would drop the tail of a build or test run, which is where the failure
+ * summary lives, so the tail keeps a reserved share of the budget.
+ */
+function fitKeepingEnds(text, budget) {
+  if (text.length <= budget) return text;
+  const notice = "\n[agent-finops: middle truncated to fit the reduction budget]\n";
+  const room = Math.max(0, budget - notice.length);
+  const tailChars = Math.floor(room * TAIL_CHAR_SHARE);
+  return text.slice(0, room - tailChars) + notice + text.slice(text.length - tailChars);
 }
 
 /** Compress stdout, preserving stderr externally and leaving short output exact. */
 export function compactStdout(stdout) {
   if (typeof stdout !== "string" || stdout.length <= MAX_CHARS) return { stdout: stdout || "", changed: false, rawChars: (stdout || "").length, sentChars: (stdout || "").length, elidedLines: 0 };
   const result = conciseLines(stdout);
-  const compacted = result.lines.join("\n").slice(0, MAX_CHARS);
+  const compacted = fitKeepingEnds(result.lines.join("\n"), MAX_CHARS);
   return { stdout: compacted, changed: compacted !== stdout, rawChars: stdout.length, sentChars: compacted.length, elidedLines: result.elided };
 }
 
@@ -141,12 +157,17 @@ export function pruneArtifacts({ olderThanMs, home = filterHome() }) {
   return removed;
 }
 
+/** POSIX single-quoting. JSON quoting would leave `$` and backticks live. */
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
 export function hookConfig(cliPath) {
   return {
     hooks: {
       PostToolUse: [{
         matcher: "Bash",
-        hooks: [{ type: "command", command: `node ${JSON.stringify(cliPath)} hook`, timeout: 10 }],
+        hooks: [{ type: "command", command: `node ${shellQuote(cliPath)} hook`, timeout: 10 }],
       }],
     },
   };

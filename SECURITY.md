@@ -17,6 +17,13 @@ project/session/request identifiers, timestamps, model IDs, token counters, and
 safe tool names. Tool names must match a restricted identifier grammar. Tool
 arguments, results, ids, prompts, response text, and paths are never retained.
 
+Project and session identifiers are salted hashes. The random per-install salt
+lives inside that same `0600` index file and is never printed, exported in
+`--json`, stored in a tag snapshot, or sent to the dashboard page. Anyone who
+can read the index can already read the whole local usage history; the salt's
+job is to stop a *shared report* from being used to confirm a guessed username
+or repository name against a bare hash.
+
 The program has no outbound network code, no subprocess calls, no telemetry,
 and no runtime dependencies. It does not read AWS credentials or invoke Bedrock.
 
@@ -27,6 +34,8 @@ boundary: it starts a one-page HTTP server bound only to `127.0.0.1`. It exposes
 no API endpoints, reads no additional files, makes no outbound connection, and
 sends a page containing only the same aggregate metadata displayed by the CLI.
 Its Content Security Policy forbids browser connections and third-party assets.
+The only image source it permits is `data:`, which covers the favicon carried
+inline in the page and cannot resolve to anything off the machine.
 Stop it with `Ctrl-C`.
 
 ## Optional output-reduction hook
