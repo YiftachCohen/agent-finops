@@ -2,10 +2,16 @@
 
 ## Reporting a vulnerability
 
-When this repository is public, report vulnerabilities through GitHub Private
-Vulnerability Reporting. Do not open a public issue or attach logs, indexes,
-credentials, prompts, or tool output. Until that GitHub setting is enabled,
-contact a maintainer privately through GitHub.
+Report vulnerabilities through [GitHub Private Vulnerability Reporting](https://github.com/YiftachCohen/agent-finops/security/advisories/new).
+Reports go directly to the repository maintainer. Do not open a public issue or
+attach logs, indexes, credentials, prompts, or tool output. Until private
+reporting is enabled, use the private contact method published on the
+[maintainer's GitHub profile](https://github.com/YiftachCohen).
+
+## Supported versions
+
+Security fixes are applied to the latest release. Upgrade before reporting a
+problem that is already resolved on `main`.
 
 ## Default commands
 

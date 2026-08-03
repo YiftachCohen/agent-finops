@@ -123,6 +123,11 @@ Changed
   aggregated the whole corpus three times.
 
 Added
+- The repository is ready for its public release under the MIT license. Package
+  metadata now links back to the canonical repository and issue tracker, the
+  README has a working fresh-clone installation path and published pricing
+  provenance, and the release gate scans reachable Git history instead of only
+  the latest tree before approving a public artifact.
 - The dashboard and `report` say what changed, not just that something did. The
   headline stated that spend rose against the previous period and stopped there,
   leaving the operator's next question — "driven by what?" — to a separate

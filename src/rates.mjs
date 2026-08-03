@@ -1,4 +1,8 @@
 // Local list-price estimates in USD per million tokens. No runtime lookup.
+// Source: the Anthropic pricing documentation cited in README.md's
+// "Estimation boundary", last verified 2026-08-02.
+// Partner-operated platforms can have independent regional pricing; these are
+// the standard rates unless a timestamped promotion below says otherwise.
 //
 // `promotion` is an introductory price that applies to usage timestamped before
 // `until`. It is stored alongside the list price rather than replacing it so a

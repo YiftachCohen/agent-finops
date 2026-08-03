@@ -1,11 +1,54 @@
-# agent-finops
+<p align="center">
+  <img src="assets/favicon-ledger.svg" width="112" height="112" alt="agent-finops ledger icon">
+</p>
 
-`agent-finops` is an owned, local-only CLI for understanding the cost of coding
-agents. It reads the local Claude Code JSONL logs already on disk, strips all
-content-bearing fields before JSON decoding, and prints aggregate token and cost
-reports. It has no outbound network code, subprocesses, dependencies, or telemetry.
+<h1 align="center">agent-finops</h1>
 
-The default data boundary is deliberately narrow:
+<p align="center">
+  <strong>Know what your coding agents cost—without sending their data anywhere.</strong>
+</p>
+
+<p align="center">
+  Local-first cost analytics for Claude Code, including Amazon Bedrock usage.
+</p>
+
+`agent-finops` turns the Claude Code logs already on your machine into useful
+spend signals: daily and per-model costs, run rate, project and session
+breakdowns, tool/MCP cohorts, and evidence-backed savings experiments.
+
+- **Private by construction.** Prompts, responses, reasoning, tool arguments,
+  terminal output, source code, and filesystem paths never enter the index.
+- **Local and inspectable.** There are no runtime dependencies, outbound network
+  calls, subprocesses, or telemetry. Reports and the dashboard stay on your
+  machine.
+- **Built for decisions.** See where spend moved, compare matched windows, and
+  rank changes by their estimated savings instead of staring at token totals.
+- **Honest about uncertainty.** Every dollar figure is a local estimate—not an
+  invoice—and causal claims are kept separate from observed cost cohorts.
+
+## Quick start
+
+Requirements: Node.js 20 or newer. Clone the repository and install a local
+launcher; no package install, registry, cloud account, or elevated permissions
+are required.
+
+```sh
+git clone https://github.com/YiftachCohen/agent-finops.git
+cd agent-finops
+./scripts/install-local.sh
+
+agent-finops doctor
+agent-finops scan
+agent-finops report --since 7d
+agent-finops dashboard --since 30d
+```
+
+By default, `agent-finops` reads `~/.claude/projects`. Use `--log-dir` or
+`AGENT_FINOPS_LOG_DIR` for a different Claude configuration directory.
+
+## Privacy boundary
+
+The data boundary is deliberately narrow:
 
 - Reads: timestamp, opaque request/message ids, model, token usage, and the
   log-file path needed to create a local session fingerprint.
@@ -24,9 +67,19 @@ The default data boundary is deliberately narrow:
   `agent-finops prune-index --older-than 90d`, which is the only thing that
   deletes it.
 
+The privacy gate strips content-bearing fields before JSON decoding. Run
+`npm run audit` to verify that invariant and the absence of outbound network
+and subprocess APIs.
+
+## Estimation boundary
+
 This is a cost-management tool, not an invoice. Its rate table is local and
-versioned in source. Bedrock region, cross-region, negotiated, and TTL-specific
-pricing can differ from the estimate. Specifically:
+versioned in source. The table follows Anthropic's published
+[Claude pricing](https://platform.claude.com/docs/en/about-claude/pricing) and
+[prompt-caching pricing](https://platform.claude.com/docs/en/build-with-claude/prompt-caching),
+last verified on 2026-08-02. Bedrock region, cross-region, negotiated, data
+residency, fast-mode, and TTL-specific pricing can differ from the estimate.
+Specifically:
 
 - Cache writes are priced by TTL: 1.25x input for a 5-minute write, 2x for a
   1-hour write. Claude Code records the split, so each turn is priced with the
@@ -37,19 +90,11 @@ pricing can differ from the estimate. Specifically:
 - Introductory pricing is applied by the timestamp on each turn, so a report
   spanning a price change prices each turn with the rate then in effect.
 
-## Open source and contributing
+## Command reference
 
-Contributions are welcome once the public repository is released. Read
-[CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) before opening
-an issue or pull request. Never attach real Claude logs, prompts, tool output,
-credentials, local indexes, or production billing data; synthetic examples are
-enough to reproduce behavior.
-
-## Install and use
-
-Requirements: Node.js 20 or newer for the CLI itself, plus
-[ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) for the audit scripts
-(`brew install ripgrep` or `apt install ripgrep`). Reporting never shells out;
+The CLI itself requires only Node.js 20 or newer. The audit scripts also require
+[ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`; install it with
+`brew install ripgrep` or `apt install ripgrep`). Reporting never shells out;
 ripgrep is only used by `npm run audit` and `npm run public-audit`.
 
 ```sh
@@ -77,9 +122,6 @@ agent-finops filter-report --since 7d
 agent-finops report --json > /private/tmp/agent-finops.json
 agent-finops doctor
 ```
-
-By default it reads `~/.claude/projects`. Use `--log-dir` or
-`AGENT_FINOPS_LOG_DIR` for a different Claude configuration directory.
 
 `--json` output contains no filesystem paths. Session and project ids are
 salted per install, so a shared report neither carries a local username nor lets
@@ -304,3 +346,16 @@ Amazon Bedrock. It intentionally does **not** call AWS. A later optional
 `reconcile aws` adapter can be added behind an explicit opt-in, using only your
 corporate AWS credentials and aggregate billing data. It should never require raw
 Bedrock invocation request/response logging.
+
+## Contributing
+
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md),
+[SECURITY.md](SECURITY.md), and the documented privacy boundary before opening
+an issue or pull request. Never attach real Claude logs, prompts, tool output,
+credentials, local indexes, or production billing data; synthetic examples are
+enough to reproduce behavior.
+
+## License
+
+[MIT](LICENSE). This is an independent project and is not affiliated with or
+endorsed by Anthropic.
