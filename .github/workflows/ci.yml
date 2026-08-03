@@ -24,7 +24,7 @@ jobs:
           # public-audit scans every commit reachable from origin branches and
           # tags; a shallow checkout would turn that into a latest-tree check.
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
       # Both audits are ripgrep-based and fail loudly when it is missing rather

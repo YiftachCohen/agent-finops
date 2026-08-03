@@ -20,7 +20,7 @@ jobs:
           ref: ${{ github.event.inputs.tag }}
           # release-check includes a reachable-history audit.
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
       # Checked before the expensive gates so a mistyped tag fails in seconds.
