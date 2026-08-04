@@ -18,18 +18,18 @@ const INDEX_MAX_AGE_MS = 3_600_000;
 function usage(message = null) {
   console.log(message || `Usage:
   agent-finops scan [--log-dir PATH] [--index PATH]
-  agent-finops report [WINDOW] [--json] [--fresh]
-  agent-finops dashboard [WINDOW] [--port 7474] [--fresh]
+  agent-finops report [WINDOW] [--show-project-names] [--json] [--fresh]
+  agent-finops dashboard [WINDOW] [--port 7474] [--show-project-names] [--fresh]
   agent-finops hotspots [WINDOW] [--json] [--fresh]
   agent-finops tools [WINDOW] [--limit 20] [--json] [--fresh]
   agent-finops mcp [WINDOW] [--limit 20] [--json] [--fresh]
-  agent-finops sessions [WINDOW] [--limit 20] [--json] [--fresh]
+  agent-finops sessions [WINDOW] [--limit 20] [--show-project-names] [--json] [--fresh]
   agent-finops session SESSION_ID [WINDOW] [--json] [--fresh]
   agent-finops compare-sessions LEFT_ID RIGHT_ID [WINDOW] [--json] [--fresh]
-  agent-finops projects [WINDOW] [--limit 20] [--json] [--fresh]
-  agent-finops project PROJECT_ID [WINDOW] [--json] [--fresh]
+  agent-finops projects [WINDOW] [--limit 20] [--show-project-names] [--json] [--fresh]
+  agent-finops project PROJECT_ID [WINDOW] [--show-project-names] [--json] [--fresh]
   agent-finops label PROJECT_ID "Friendly name"
-  agent-finops trend [--days 7] [--json] [--fresh]
+  agent-finops trend [--days 7] [--show-project-names] [--json] [--fresh]
   agent-finops tag NAME [WINDOW] [--fresh]
   agent-finops compare BASELINE EXPERIMENT [--json]
   agent-finops hook-config
@@ -46,7 +46,9 @@ timestamp, and the window is [from, to): the start is included and the end is
 excluded, so --from 2026-07-01 --to 2026-08-01 is exactly July. Either bound may
 be given on its own. \`trend\` uses --days instead.
 
-Everything is local. The index stores hashed IDs and token metadata only.`);
+Everything is local. The index stores hashed IDs and token metadata only.
+--show-project-names reveals live Claude project-directory identifiers in human
+output only; it is never stored or available with --json.`);
 }
 
 export function parseArgs(argv) {
@@ -60,6 +62,7 @@ export function parseArgs(argv) {
     command: argv[0] === "--help" || argv[0] === "-h" ? "report" : (argv[0] || "report"),
     positional: [],
     json: false,
+    showProjectNames: false,
     fresh: false,
     since: null,
     from: null,
@@ -75,6 +78,7 @@ export function parseArgs(argv) {
   for (let i = 1; i < argv.length; i++) {
     const flag = argv[i];
     if (flag === "--json") args.json = true;
+    else if (flag === "--show-project-names") args.showProjectNames = true;
     else if (flag === "--fresh") args.fresh = true;
     else if (flag === "--since") args.since = value(argv, ++i, flag);
     else if (flag === "--from") args.from = value(argv, ++i, flag);
@@ -228,11 +232,26 @@ function projects(report, labels) {
   return result;
 }
 
+/**
+ * Resolve the original Claude project-directory identifier only for an
+ * explicitly requested human view. This mapping is rebuilt from live paths on
+ * each invocation and is intentionally never passed to the metadata index.
+ */
+function revealedProjectNames(args, index) {
+  if (!args.showProjectNames) return {};
+  const names = {};
+  for (const file of findClaudeJsonl(args.logDir, index.salt)) {
+    if (file.projectName) names[file.project] = file.projectName;
+  }
+  return names;
+}
+
 async function main() {
   let args;
   try { args = parseArgs(process.argv.slice(2)); } catch (error) { console.error(error.message); usage(); process.exitCode = 2; return; }
   if (args.help) return usage();
   try {
+    if (args.json && args.showProjectNames) throw new Error("--show-project-names is unavailable with --json because JSON is the shareable anonymous artifact.");
     if (args.command === "hook") {
       // A hook must write only a valid decision object on stdout. Any error is
       // deliberately non-blocking so an accounting feature cannot break coding.
@@ -325,6 +344,11 @@ async function main() {
     const { sinceMs, untilMs } = timeWindow(args);
     const { index, scanStats } = await indexFor(args);
     const records = indexedRecords(index);
+    const labels = loadLabels();
+    const projectNames = revealedProjectNames(args, index);
+    // Explicit labels remain the presentation preference. When there is no
+    // label, this adds an ephemeral source identifier only to human renderers.
+    const displayLabels = { ...projectNames, ...labels };
     // One report per command. Deliberately no index path in the decoration:
     // `report --json` is the artifact people share, and an absolute path
     // carries the local username. `doctor` prints paths.
@@ -337,9 +361,9 @@ async function main() {
       // The scan timestamp travels onto the page so an index that predates the
       // window is legible as a stale read rather than as an empty month.
       const dashboardReport = reportWith({ sessionLimit: 12, toolLimit: 12, projectLimit: 12 });
-      // Local project labels are the user's own names for anonymous ids. They
-      // carry no path, so they can name a row on the page instead of a
-      // fingerprint nobody can place.
+      // A user label wins over an opt-in live source identifier. The latter is
+      // intentionally available only for this running dashboard, never JSON or
+      // the persistent index.
       const extras = hotspotExtras(records, sinceMs);
       const analysis = hotspotAnalysis(dashboardReport, extras);
       // The page's "what changed" section reads the same trend the hotspot rules
@@ -350,8 +374,9 @@ async function main() {
       // "what changed" regardless of how much history is on screen. The section
       // states the windows it used. `extras.trend` is absent when the index
       // holds too little history, and the section says so rather than vanishing.
-      const running = await startDashboard(dashboardReport, analysis, { port: args.port, labels: loadLabels(), trend: extras.trend || null });
+      const running = await startDashboard(dashboardReport, analysis, { port: args.port, labels: displayLabels, trend: extras.trend || null });
       console.log(`Dashboard running at ${running.url}`);
+      if (args.showProjectNames) console.log("Project-directory identifiers are visible in this local dashboard; do not screenshot or share it.");
       console.log("Loopback only. Press Ctrl-C to stop.");
       await new Promise((resolve) => running.server.once("close", resolve));
       return;
@@ -371,7 +396,7 @@ async function main() {
       let trend = null;
       try { trend = analyzeTrend(records, { days: 7 }); } catch { /* not enough history */ }
       // Local project labels name the anonymous ids in the terminal view only.
-      console.log(humanReport(report, loadLabels(), trend));
+      console.log(humanReport(report, displayLabels, trend, { projectNamesVisible: args.showProjectNames }));
       return;
     }
     if (args.command === "hotspots") {
@@ -382,7 +407,7 @@ async function main() {
     }
     if (args.command === "sessions") {
       const sessionReport = buildReport(records, { sinceMs, untilMs, sessionLimit: listLimit(args.limit) });
-      console.log(args.json ? JSON.stringify(sessionReport.topSessions, null, 2) : humanSessions(sessionReport.topSessions, loadLabels()));
+      console.log(args.json ? JSON.stringify(sessionReport.topSessions, null, 2) : humanSessions(sessionReport.topSessions, displayLabels));
       return;
     }
     if (args.command === "session") {
@@ -390,7 +415,7 @@ async function main() {
       if (!id) throw new Error("session requires a session ID printed by `agent-finops sessions`.");
       const sessionReport = buildReport(records.filter((record) => record.source === id), { sinceMs, untilMs, toolLimit: listLimit(args.limit) });
       if (!sessionReport.scope.recordsAfterDateFilter) throw new Error(`No usage records found for session ${id} in this period.`);
-      console.log(args.json ? JSON.stringify(sessionReport, null, 2) : humanReport(sessionReport, loadLabels()));
+      console.log(args.json ? JSON.stringify(sessionReport, null, 2) : humanReport(sessionReport, displayLabels, null, { projectNamesVisible: args.showProjectNames }));
       return;
     }
     if (args.command === "compare-sessions") {
@@ -412,11 +437,10 @@ async function main() {
       return;
     }
     if (args.command === "projects") {
-      const labels = loadLabels();
       const projectReport = buildReport(records, { sinceMs, untilMs, projectLimit: listLimit(args.limit) });
       const output = projects(projectReport, labels);
       if (args.json) console.log(JSON.stringify(output, null, 2));
-      else console.log(["Projects:", ...output.map((item) => `  ${displayProject(item.id, labels).padEnd(28)} $${item.usd.toFixed(2)}  ${Math.round(item.tokens).toLocaleString()} tokens  ${item.requests} turns`), "", "Project paths are never stored or printed. Use `agent-finops label PROJECT_ID \"Name\"` to label an id locally."].join("\n"));
+      else console.log(["Projects:", ...output.map((item) => `  ${displayProject(item.id, labels, projectNames).padEnd(28)} $${item.usd.toFixed(2)}  ${Math.round(item.tokens).toLocaleString()} tokens  ${item.requests} turns`), "", args.showProjectNames ? "Project-directory identifiers are shown from live logs only; they are not stored. Use `agent-finops label PROJECT_ID \"Name\"` for a share-safe local name." : "Project paths are never stored or printed. Use `agent-finops label PROJECT_ID \"Name\"` to label an id locally."].join("\n"));
       return;
     }
     if (args.command === "project") {
@@ -426,13 +450,12 @@ async function main() {
       if (!projectReport.scope.recordsAfterDateFilter) throw new Error(`No usage records found for project ${id} in this period.`);
       // The label is a local name for the id, so it heads the report rather than
       // entering it: the JSON body is the artifact people share.
-      const projectLabels = loadLabels();
-      console.log(args.json ? JSON.stringify(projectReport, null, 2) : `Project: ${displayProject(id, projectLabels)}\n${humanReport(projectReport, projectLabels)}`);
+      console.log(args.json ? JSON.stringify(projectReport, null, 2) : `Project: ${displayProject(id, labels, projectNames)}\n${humanReport(projectReport, displayLabels, null, { projectNamesVisible: args.showProjectNames })}`);
       return;
     }
     if (args.command === "trend") {
       const trend = analyzeTrend(records, { days: args.days });
-      console.log(args.json ? JSON.stringify(trend, null, 2) : humanTrend(trend));
+      console.log(args.json ? JSON.stringify(trend, null, 2) : humanTrend(trend, labels, projectNames));
       return;
     }
     if (args.command === "tag") {

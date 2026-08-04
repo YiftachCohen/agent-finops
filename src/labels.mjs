@@ -34,6 +34,7 @@ export function saveLabel(id, label, path = defaultLabelsPath()) {
   return labels;
 }
 
-export function displayProject(id, labels = {}) {
-  return labels[id] ? `${labels[id]} (${id})` : id;
+export function displayProject(id, labels = {}, revealedNames = {}) {
+  const name = labels[id] || revealedNames[id];
+  return name ? `${name} (${id})` : id;
 }
