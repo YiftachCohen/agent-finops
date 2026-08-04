@@ -925,7 +925,7 @@ function perTurnLine(report) {
  * Absent — a caller with no history, or one that never asked for it — the report
  * is exactly what it was before.
  */
-export function humanReport(report, labels = {}, trend = null) {
+export function humanReport(report, labels = {}, trend = null, { projectNamesVisible = false } = {}) {
   const number = tokenFormat;
   const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
   const u = report.total.usage;
@@ -959,7 +959,9 @@ export function humanReport(report, labels = {}, trend = null) {
     for (const value of report.topProjects) {
       lines.push(`  ${displayProject(value.id, labels).padEnd(28)} ${usd.format(value.usd).padStart(10)}  ${number.format(value.usage.total).padStart(12)} tokens  ${value.requests} turns`);
     }
-    lines.push("  Project paths are never stored or printed. Use `agent-finops label PROJECT_ID \"Name\"` to label an id locally.");
+    lines.push(projectNamesVisible
+      ? "  Project-directory identifiers are shown from live logs only; they are not stored. Use `agent-finops label PROJECT_ID \"Name\"` for a share-safe local name."
+      : "  Project paths are never stored or printed. Use `agent-finops label PROJECT_ID \"Name\"` to label an id locally.");
   }
   if (report.topSessions.length) {
     lines.push("", "Top anonymous sessions:");

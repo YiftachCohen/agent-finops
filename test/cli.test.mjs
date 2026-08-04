@@ -63,6 +63,34 @@ test("CLI produces a JSON report without prompt content", async () => {
   }
 });
 
+test("project names are an opt-in live display and never enter the index or JSON", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-finops-reveal-project-"));
+  const project = "client-private-dashboard";
+  try {
+    mkdirSync(join(root, project));
+    const index = join(root, "index.json");
+    writeFileSync(join(root, project, "session.jsonl"), `{"type":"assistant","requestId":"r1","timestamp":"2026-08-01T10:00:00Z","message":{"id":"m1","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5}}}`);
+    const shared = ["--log-dir", root, "--index", index, "--fresh"];
+
+    const normal = (await run("node", [CLI, "projects", ...shared])).stdout;
+    assert.ok(!normal.includes(project));
+
+    const revealed = (await run("node", [CLI, "projects", "--show-project-names", ...shared])).stdout;
+    assert.match(revealed, new RegExp(project));
+    assert.match(revealed, /not stored/);
+    const report = (await run("node", [CLI, "report", "--show-project-names", ...shared])).stdout;
+    assert.match(report, new RegExp(project));
+    assert.doesNotMatch(report, /Project paths are never stored or printed/);
+    assert.ok(!readFileSync(index, "utf8").includes(project), "the source identifier must not cross into the index");
+
+    const rejected = await runWithStdin(["projects", "--show-project-names", "--json", ...shared], "");
+    assert.equal(rejected.code, 1);
+    assert.match(rejected.stderr, /unavailable with --json/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("report names what changed between the last two weeks, and --json is unaffected", async () => {
   const root = mkdtempSync(join(tmpdir(), "agent-finops-changed-"));
   try {

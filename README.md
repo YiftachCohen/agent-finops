@@ -104,6 +104,7 @@ npm run audit
 agent-finops scan
 agent-finops report --since 7d
 agent-finops report --from 2026-07-01 --to 2026-08-01
+agent-finops report --show-project-names
 agent-finops dashboard --since 30d
 agent-finops trend --days 7
 agent-finops hotspots --since 24h
@@ -128,6 +129,14 @@ salted per install, so a shared report neither carries a local username nor lets
 a reader confirm a guessed one — and ids from two machines, or from the same
 machine before and after a reinstall, cannot be lined up with each other. Run
 `doctor` when you need to see which index and log directory are in use.
+
+For a human-only local view, add `--show-project-names` to `report`,
+`projects`, `project`, `sessions`, `trend`, or `dashboard`. It resolves the
+original Claude project-directory identifier from currently live log paths for
+that one command; it is not added to the index, tags, or JSON output. A friendly
+`label` remains the safe choice for a name you may later share. The flag is
+rejected with `--json`, and retired logs continue to show their anonymous id
+because their source path is no longer available.
 
 ### Time windows
 

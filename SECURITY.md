@@ -30,6 +30,11 @@ can read the index can already read the whole local usage history; the salt's
 job is to stop a *shared report* from being used to confirm a guessed username
 or repository name against a bare hash.
 
+`--show-project-names` is an explicit local-display exception. It derives the
+Claude project-directory identifier from a currently live log path in memory
+for that command only. It is never written to the index or tags and is rejected
+with `--json`; dashboard output in this mode must not be screenshot or shared.
+
 The program has no outbound network code, no subprocess calls, no telemetry,
 and no runtime dependencies. It does not read AWS credentials or invoke Bedrock.
 

@@ -1,4 +1,5 @@
 import { buildReport } from "./report.mjs";
+import { displayProject } from "./labels.mjs";
 
 function startOfUtcDay(now = new Date()) {
   return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
@@ -83,7 +84,7 @@ export function analyzeTrend(records, { days = 7, now = new Date() } = {}) {
   };
 }
 
-export function humanTrend(trend) {
+export function humanTrend(trend, labels = {}, revealedNames = {}) {
   const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
   const pct = trend.deltaPct == null ? "n/a" : `${(trend.deltaPct * 100).toFixed(1)}%`;
   const lines = [
@@ -105,7 +106,7 @@ export function humanTrend(trend) {
   if (byModel.length || byProject.length) {
     lines.push("", "Largest drivers:");
     for (const row of byModel) lines.push(`  model    ${row.model.padEnd(24)} ${money.format(row.deltaUsd)}`);
-    for (const row of byProject) lines.push(`  project  ${row.id.padEnd(24)} ${money.format(row.deltaUsd)}`);
+    for (const row of byProject) lines.push(`  project  ${displayProject(row.id, labels, revealedNames).padEnd(24)} ${money.format(row.deltaUsd)}`);
     if (byProject.length) lines.push("  Project deltas cover the projects ranked highest in either window.");
   }
   lines.push("", "Use this as a spending trend, not proof that a configuration change caused it. Compare tagged, matched task windows for causal experiments.");

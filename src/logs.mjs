@@ -27,6 +27,9 @@ export function findClaudeJsonl(root, salt = "") {
         path,
         source: fingerprint(path, salt),
         project: fingerprint(firstSegment, salt),
+        // This is deliberately scan-local. Callers may use it for an explicit
+        // terminal/dashboard reveal, but updateIndex persists only `project`.
+        projectName: firstSegment,
         mtimeMs: stat.mtimeMs,
         size: stat.size,
       };
